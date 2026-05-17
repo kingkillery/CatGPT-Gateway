@@ -108,9 +108,10 @@ cp .env.example .env
 docker compose up --build -d
 
 # Open the browser UI to log in (one-time)
-open http://localhost:6080
-# Sign into Claude or ChatGPT in the browser you see
-# Close the tab when done - your session is saved
+open http://localhost:6080/vnc.html
+# Sign into Claude or ChatGPT using EMAIL + PASSWORD or Microsoft/Apple/magic link
+# ⚠ Google login is blocked by Google in automated browser contexts — don't use it
+# Close the noVNC tab when done - your session is saved to a Docker volume
 
 # Verify it works
 curl -H "Authorization: Bearer dummy123" http://localhost:8000/v1/models
@@ -129,7 +130,8 @@ patchright install chromium
 # Copy env and pick your provider
 cp .env.example .env
 
-# First login (one-time - a browser window opens, sign in manually)
+# First login (one-time - a browser window opens)
+# Use email + password, Microsoft, Apple, or magic link — NOT Google OAuth
 python scripts/first_login.py
 
 # Start the API server

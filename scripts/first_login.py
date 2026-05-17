@@ -36,8 +36,17 @@ async def main():
         print(f"\n  Provider:         {provider_name}")
         print(f"  Browser data dir: {Config.BROWSER_DATA_DIR}")
         print(f"  Target:           {provider_url}")
+        print("\n  " + "!" * 56)
+        print("  IMPORTANT: Google login will NOT work here.")
+        print("  Chromium in a controlled/automated context is blocked")
+        print("  by Google's OAuth bot detection. Use instead:")
+        print("    • Email + password  (most reliable)")
+        print("    • Microsoft account")
+        print("    • Apple ID")
+        print("    • Magic link / OTP sent to your email")
+        print("  " + "!" * 56)
         print("\n  A Chrome window will open. Please:")
-        print(f"  1. Sign in to {provider_name} with your account")
+        print(f"  1. Sign in to {provider_name} with your account (NOT Google)")
         print("  2. Complete any CAPTCHA / Cloudflare checks")
         print("  3. Wait until you see the chat interface")
         print("  4. Come back here and press Enter")
@@ -66,12 +75,6 @@ async def main():
             print("\n  Could not verify login. Session may still be saved.")
             print("  Try running test_phase1.py to check.\n")
             log.warning("Login verification uncertain")
-
-    except KeyboardInterrupt:
-        print("\n\n  Cancelled by user.")
-    finally:
-        await browser.close()
-        print("  Browser closed.\n")
 
     except KeyboardInterrupt:
         print("\n\n  Cancelled by user.")

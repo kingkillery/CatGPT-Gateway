@@ -143,21 +143,32 @@ Notes:
 
 CatGPT Gateway uses your existing browser session. You sign in **once** and the browser profile is persisted.
 
+> **⚠ Google login will not work.**
+> Patchright/Chromium runs in a controlled automation context. Google's OAuth detects this and blocks the sign-in.
+> **Use email + password, Microsoft, Apple, or magic link / OTP instead.**
+
 ### Docker
 
 1. Start the container: `docker compose up --build -d`
-2. Wait about 30 seconds for startup
-3. Open **http://localhost:6080** (noVNC) in your browser
+2. Wait ~30 seconds for startup
+3. Open **http://localhost:6080/vnc.html** (noVNC) in your browser
 4. You'll see a Chromium browser inside the VNC viewer
-5. Sign into Claude or ChatGPT (depending on your `PROVIDER` setting)
-6. Verify you see the chat page
-7. Close the noVNC tab. Your session is saved in the Docker volume.
+5. Sign into your provider using one of these methods:
+   | Method | Works? |
+   |---|---|
+   | Email + password | ✅ Recommended |
+   | Microsoft account | ✅ Works |
+   | Apple ID | ✅ Works |
+   | Magic link / OTP email | ✅ Works |
+   | **Google / "Continue with Google"** | ❌ Blocked by Google |
+6. Verify you see the chat interface
+7. Close the noVNC tab — your session is saved in the `catgpt_browser_data` Docker volume and survives container restarts.
 
 ### Local
 
 1. Run `python scripts/first_login.py`
 2. A Chromium window opens and navigates to your provider
-3. Sign in manually
+3. Sign in using **email + password** or a non-Google method (see table above)
 4. Press Enter in the terminal when you see the chat page
 5. The browser closes. Session is saved in `browser_data/` (or `browser_data_claude/`).
 

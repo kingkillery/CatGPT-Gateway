@@ -17,6 +17,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    image: catgpt-gateway
     container_name: catgpt
     restart: unless-stopped
 
