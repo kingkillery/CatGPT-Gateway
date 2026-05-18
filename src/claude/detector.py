@@ -172,7 +172,7 @@ async def _wait_for_new_turn_signature(
 ) -> bool:
     """Wait until latest assistant-turn signature differs from previous one."""
     elapsed = 0
-    poll_interval = 0.5
+    poll_interval = Config.POLL_INTERVAL_MS / 1000
     heartbeat = 10
 
     while elapsed * 1000 < timeout_ms:
@@ -258,7 +258,7 @@ async def _wait_for_streaming_complete(
     This is the primary and most reliable completion signal for Claude.
     """
     elapsed = 0
-    poll_interval = 0.5
+    poll_interval = Config.POLL_INTERVAL_MS / 1000
     heartbeat = 10
 
     while elapsed * 1000 < timeout_ms:
@@ -295,7 +295,7 @@ async def _wait_for_copy_button(
 ) -> bool:
     """Wait for copy button to appear on the latest assistant turn."""
     elapsed = 0
-    poll_interval = 1.0
+    poll_interval = Config.POLL_INTERVAL_MS / 1000
 
     while elapsed * 1000 < timeout_ms:
         snapshot = await _latest_assistant_turn_snapshot(page)
@@ -327,10 +327,10 @@ async def _wait_via_text_stability(
     Last resort: poll latest assistant-turn text and wait until stable.
     """
     stable_count = 0
-    required_stable = 5
+    required_stable = 3
     last_text = ""
     elapsed = 0
-    poll_interval = 1.0
+    poll_interval = Config.POLL_INTERVAL_MS / 1000
 
     while elapsed * 1000 < timeout_ms:
         snapshot = await _latest_assistant_turn_snapshot(page)

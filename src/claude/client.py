@@ -70,7 +70,7 @@ class ClaudeClient:
         log.debug(f"Latest assistant turn before send: {pre_turn_signature}")
 
         # 1. Brief pause (human would take a moment to start typing)
-        await random_delay(500, 1200)
+        await random_delay(250, 700)
 
         # 1.5. Upload files/images if provided
         if all_attachments:
@@ -85,7 +85,7 @@ class ClaudeClient:
         await human_type(self._page, input_selector, text)
 
         # Small pause after pasting
-        await random_delay(300, 600)
+        await random_delay(150, 350)
 
         # 4. Send the message
         sent = await self._click_send()
@@ -107,7 +107,7 @@ class ClaudeClient:
             log.warning("Response may not be complete (timeout)")
 
         # Small buffer after completion to let DOM settle
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.5)
 
         # 6. Extract text content (Claude doesn't generate images like DALL-E)
         response_text = await extract_last_response_via_copy(
@@ -162,7 +162,7 @@ class ClaudeClient:
         log.info("Starting new chat...")
         url = Config.CLAUDE_URL.rstrip("/") + "/new"
         await self._page.goto(url, wait_until="domcontentloaded")
-        await asyncio.sleep(3)
+        await asyncio.sleep(1.5)
 
         # Wait for the chat input to be visible
         for selector in ClaudeSelectors.CHAT_INPUT:
@@ -173,7 +173,7 @@ class ClaudeClient:
             except Exception:
                 continue
 
-        await random_delay(500, 1000)
+        await random_delay(300, 600)
         log.info("New chat started (navigated to /new)")
 
     async def navigate_to_thread(self, thread_id: str) -> None:
@@ -181,7 +181,7 @@ class ClaudeClient:
         url = f"{Config.CLAUDE_URL.rstrip('/')}/chat/{thread_id}"
         log.info(f"Navigating to thread: {thread_id}")
         await self._page.goto(url, wait_until="domcontentloaded")
-        await random_delay(1500, 3000)
+        await random_delay(800, 1500)
         log.info(f"Thread {thread_id} loaded")
 
     async def get_current_thread_url(self) -> str:

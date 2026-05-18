@@ -57,8 +57,10 @@ class Config:
     # Human simulation (ms)
     TYPING_SPEED_MIN: int = int(os.getenv("TYPING_SPEED_MIN", "50"))
     TYPING_SPEED_MAX: int = int(os.getenv("TYPING_SPEED_MAX", "150"))
-    THINKING_PAUSE_MIN: int = int(os.getenv("THINKING_PAUSE_MIN", "1000"))
-    THINKING_PAUSE_MAX: int = int(os.getenv("THINKING_PAUSE_MAX", "3000"))
+    THINKING_PAUSE_MIN: int = int(os.getenv("THINKING_PAUSE_MIN", "500"))
+    THINKING_PAUSE_MAX: int = int(os.getenv("THINKING_PAUSE_MAX", "1500"))
+    # Completion poll interval — how often to check if response is ready (ms)
+    POLL_INTERVAL_MS: int = int(os.getenv("POLL_INTERVAL_MS", "500"))
 
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "DEBUG")

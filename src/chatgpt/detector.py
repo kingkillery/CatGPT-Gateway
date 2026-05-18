@@ -204,7 +204,7 @@ async def _wait_for_new_turn_signature(
 ) -> bool:
     """Wait until latest assistant-turn signature differs from previous one."""
     elapsed = 0
-    poll_interval = 0.5
+    poll_interval = Config.POLL_INTERVAL_MS / 1000
     heartbeat = 10
 
     while elapsed * 1000 < timeout_ms:
@@ -292,7 +292,7 @@ async def _wait_for_copy_button_or_image(
     Returns "copy", "image", or None if timed out.
     """
     elapsed = 0
-    poll_interval = 1.0
+    poll_interval = Config.POLL_INTERVAL_MS / 1000
     heartbeat = 10
 
     while elapsed * 1000 < timeout_ms:
@@ -312,7 +312,7 @@ async def _wait_for_copy_button_or_image(
 
         has_image = await _detect_image_in_latest_turn(page, previous_turn_signature)
         if has_image:
-            await asyncio.sleep(2)
+            await asyncio.sleep(1.0)
             log.debug(f"Generated image detected on latest turn {signature}")
             return "image"
 
@@ -368,10 +368,10 @@ async def _wait_via_text_stability(
     If previous_turn_signature is provided, ignores stabilization on that old turn.
     """
     stable_count = 0
-    required_stable = 5
+    required_stable = 3
     last_text = ""
     elapsed = 0
-    poll_interval = 1.0
+    poll_interval = Config.POLL_INTERVAL_MS / 1000
 
     while elapsed * 1000 < timeout_ms:
         snapshot = await _latest_assistant_turn_snapshot(page)

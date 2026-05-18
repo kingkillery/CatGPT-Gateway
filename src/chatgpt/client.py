@@ -77,7 +77,7 @@ class ChatGPTClient:
         log.debug(f"Latest assistant turn before send: {pre_turn_signature}")
 
         # 1. Brief pause (human would take a moment to start typing)
-        await random_delay(500, 1200)
+        await random_delay(250, 700)
 
         # 1.5. Upload files/images if provided
         if all_attachments:
@@ -92,7 +92,7 @@ class ChatGPTClient:
         await human_type(self._page, input_selector, text)
 
         # Small pause after pasting (like a human reviewing before send)
-        await random_delay(300, 600)
+        await random_delay(150, 350)
 
         # 4. Send the message
         sent = await self._click_send()
@@ -114,7 +114,7 @@ class ChatGPTClient:
             log.warning("Response may not be complete (timeout)")
 
         # Small buffer after completion to let DOM settle
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.5)
 
         # 6. Check for generated images in the response FIRST
         #    (image turns have no copy button, so we must detect images
@@ -186,7 +186,7 @@ class ChatGPTClient:
         log.info("Starting new chat...")
         # Direct navigation is the most reliable way — avoids duplicate button issues
         await self._page.goto(Config.CHATGPT_URL, wait_until="domcontentloaded")
-        await asyncio.sleep(3)
+        await asyncio.sleep(1.5)
 
         # Wait for the chat input to be visible (signals page is ready)
         for selector in Selectors.CHAT_INPUT:
@@ -197,7 +197,7 @@ class ChatGPTClient:
             except Exception:
                 continue
 
-        await random_delay(500, 1000)
+        await random_delay(300, 600)
         log.info("New chat started (navigated to home)")
 
     async def navigate_to_thread(self, thread_id: str) -> None:
@@ -205,7 +205,7 @@ class ChatGPTClient:
         url = f"{Config.CHATGPT_URL}/c/{thread_id}"
         log.info(f"Navigating to thread: {thread_id}")
         await self._page.goto(url, wait_until="domcontentloaded")
-        await random_delay(1500, 3000)
+        await random_delay(800, 1500)
         log.info(f"Thread {thread_id} loaded")
 
     async def get_current_thread_url(self) -> str:
