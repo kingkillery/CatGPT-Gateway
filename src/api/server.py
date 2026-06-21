@@ -16,9 +16,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from src.browser.manager import BrowserManager
 from src.browser.auto_login import ensure_logged_in
@@ -106,38 +106,61 @@ app = FastAPI(
 )
 
 # ── Bearer Token Auth Middleware ────────────────────────────────
-class BearerTokenMiddleware(BaseHTTPMiddleware):
+class BearerTokenMiddleware:
     """
-    Require a Bearer token on all API requests when API_TOKEN is set.
+    Pure ASGI middleware for Bearer token auth.
+
+    Uses raw ASGI protocol instead of BaseHTTPMiddleware to avoid the
+    Python 3.9 event-loop mismatch bug that corrupts asyncio.Lock
+    when exceptions propagate through BaseHTTPMiddleware's task group.
+
     Skips auth for /docs, /openapi.json, and health-check paths.
     """
 
-    OPEN_PATHS = {"/docs", "/redoc", "/openapi.json", "/healthz"}
+    OPEN_PATHS = {b"/docs", b"/redoc", b"/openapi.json", b"/healthz"}
 
-    async def dispatch(self, request: Request, call_next):
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
         token = Config.API_TOKEN
         if not token:
-            # No token configured — auth disabled
-            return await call_next(request)
+            await self.app(scope, receive, send)
+            return
 
-        path = request.url.path
-        if path in self.OPEN_PATHS:
-            return await call_next(request)
+        path = scope.get("path", "").encode() if isinstance(scope.get("path"), str) else scope.get("raw_path", b"")
+        # Also check the string path for comparison
+        path_str = scope.get("path", "")
+        if path_str in {"/docs", "/redoc", "/openapi.json", "/healthz"}:
+            await self.app(scope, receive, send)
+            return
 
-        # Check Authorization header
-        auth_header = request.headers.get("authorization", "")
-        if auth_header.startswith("Bearer "):
-            provided = auth_header[7:]
-        else:
-            provided = ""
+        # Extract Authorization header
+        headers = dict(scope.get("headers", []))
+        auth_value = headers.get(b"authorization", b"").decode()
+
+        provided = ""
+        if auth_value.startswith("Bearer "):
+            provided = auth_value[7:]
 
         if provided != token:
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=401,
-                content={"error": {"message": "Invalid or missing API token. Set Authorization: Bearer <API_TOKEN>", "type": "auth_error"}},
+                content={
+                    "error": {
+                        "message": "Invalid or missing API token. Set Authorization: Bearer <API_TOKEN>",
+                        "type": "auth_error",
+                    }
+                },
             )
+            await response(scope, receive, send)
+            return
 
-        return await call_next(request)
+        await self.app(scope, receive, send)
 
 
 app.add_middleware(BearerTokenMiddleware)
