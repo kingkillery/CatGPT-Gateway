@@ -77,14 +77,18 @@ _MIN_MESSAGE_GAP = 3.0  # Minimum seconds between messages (ChatGPT needs cooldo
 
 
 async def _ensure_fresh_chat() -> None:
-    """Enforce cooldown between messages and start new chat if thread is full.
+    """Enforce cooldown and ensure the next message is sent in a fresh chat.
 
-    ChatGPT's web UI degrades after ~6-8 messages in a thread (stops
-    generating, copy-button never appears). We preemptively start a
-    new chat after _MAX_THREAD_MESSAGES to prevent this.
+    For ChatGPT we keep every conversation in a TEMPORARY chat
+    (?temporary-chat=true) so it is never saved to the sidebar history: a new
+    temporary chat is started whenever the page is not already on one, or when
+    the current thread has accumulated enough messages that ChatGPT's UI starts
+    to degrade (~6-8). Conversation context is flattened into each prompt, so a
+    fresh chat never loses memory. Claude has no temporary-chat mode, so it
+    keeps the count-based rotation only.
 
-    Also enforces a minimum gap between consecutive messages, since
-    ChatGPT's UI may not accept rapid-fire messages properly.
+    Also enforces a minimum gap between consecutive messages, since the UI may
+    not accept rapid-fire messages properly.
     """
     global _thread_message_count, _last_response_time
 
@@ -96,10 +100,22 @@ async def _ensure_fresh_chat() -> None:
             log.debug(f"Cooldown: waiting {wait:.1f}s before next message")
             await asyncio.sleep(wait)
 
-    if _thread_message_count < _MAX_THREAD_MESSAGES:
-        return  # Thread is fresh enough — no navigation needed
-
     client = _get_client()
+
+    # Decide whether to (re)start a chat.
+    needs_new = _thread_message_count >= _MAX_THREAD_MESSAGES
+    if Config.PROVIDER == "chatgpt":
+        # ChatGPT: require a temporary chat so nothing is saved to history.
+        try:
+            on_temp_chat = "temporary-chat=true" in (client.page.url or "")
+        except Exception:
+            on_temp_chat = False
+        if not on_temp_chat:
+            needs_new = True
+
+    if not needs_new:
+        return  # Already on a usable (temporary) chat — no navigation needed
+
     try:
         await client.new_chat()
         _thread_message_count = 0
