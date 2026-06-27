@@ -622,31 +622,28 @@ class ChatGPTClient:
 
         log.info(f"Uploading {len(valid_paths)} file(s)...")
 
-        # Find the file input element — ChatGPT has a hidden <input type="file">
-        file_input = None
-        for selector in Selectors.FILE_UPLOAD_INPUT:
-            try:
-                elements = await self._page.query_selector_all(selector)
-                if elements:
-                    file_input = elements[0]
-                    log.debug(f"Found file input: {selector}")
-                    break
-            except Exception:
-                continue
+        # Pick the best file input. ChatGPT exposes a general input[type=file]
+        # (accepts images AND documents) plus an image-only shortcut
+        # (#upload-photos). The old code grabbed #upload-photos first, which
+        # silently dropped non-image files. Prefer the general/unrestricted input.
+        picked = await self._pick_file_input()
+        if picked is None:
+            log.info("No file input present; clicking attach button to mount it")
+            await self._click_attach_button()
+            await asyncio.sleep(1.5)
+            picked = await self._pick_file_input()
 
-        if file_input:
-            # Set files directly on the input element
-            await file_input.set_input_files(valid_paths)
-            log.info(f"Set {len(valid_paths)} file(s) on file input")
-        else:
-            # Fallback: use page.set_input_files with a broad selector
-            log.info("No file input found via selectors, trying broad input[type=file]")
-            try:
-                await self._page.set_input_files("input[type='file']", valid_paths)
-                log.info(f"Set {len(valid_paths)} file(s) via broad selector")
-            except Exception as e:
-                log.error(f"Failed to upload files: {e}")
-                raise RuntimeError(f"Could not upload files: {e}")
+        if picked is None:
+            log.error("No file input found (even after clicking attach)")
+            raise RuntimeError("Could not find a file input to upload to")
+
+        log.info(f"Using file input: {picked}")
+        try:
+            await self._page.set_input_files('[data-catgpt-upload="1"]', valid_paths)
+            log.info(f"Set {len(valid_paths)} file(s) on chosen input")
+        except Exception as e:
+            log.error(f"Failed to set files on chosen input: {e}")
+            raise RuntimeError(f"Could not upload files: {e}")
 
         # Wait for the upload to actually finish (uploads can take a while for
         # large files). Poll the composer for an attachment chip and the absence
@@ -698,10 +695,61 @@ class ChatGPTClient:
             await asyncio.sleep(poll)
             elapsed += poll
 
+        if not appeared:
+            raise RuntimeError(
+                f"File attachment did not register after {int(elapsed)}s "
+                "(no attachment chip appeared) — refusing to send without the file"
+            )
         log.warning(
-            f"Upload wait timed out after {int(elapsed)}s "
-            f"(attachment_seen={appeared}); sending anyway"
+            f"Upload still showed in-progress after {int(elapsed)}s; sending anyway"
         )
+
+    async def _pick_file_input(self) -> dict | None:
+        """Tag the best file input and return a short description, or None.
+
+        ChatGPT's general input[type=file] accepts images AND documents; the
+        image-only `#upload-photos` shortcut silently drops non-image files, so
+        it is ranked lowest. The chosen input is tagged `data-catgpt-upload=1`.
+        """
+        return await self._page.evaluate(
+            """() => {
+                const inputs = [...document.querySelectorAll('input[type=file]')];
+                if (!inputs.length) return null;
+                const rank = (i) => {
+                    const a = (i.getAttribute('accept') || '').toLowerCase();
+                    if (i.id === 'upload-photos') return 0;
+                    if (!a || a.includes('*/*')) return 3;
+                    if (a.includes('pdf') || a.includes('text') || a.includes('application')) return 3;
+                    if (a.includes('image')) return 1;
+                    return 2;
+                };
+                inputs.forEach(i => i.removeAttribute('data-catgpt-upload'));
+                let best = inputs[0], bs = rank(inputs[0]);
+                for (const i of inputs) { const s = rank(i); if (s > bs) { bs = s; best = i; } }
+                best.setAttribute('data-catgpt-upload', '1');
+                return {id: best.id || '(none)', accept: best.getAttribute('accept'),
+                        rank: bs, total: inputs.length};
+            }"""
+        )
+
+    async def _click_attach_button(self) -> bool:
+        """Click the composer attach ('+'/paperclip) button to mount the input."""
+        try:
+            return bool(await self._page.evaluate(
+                """() => {
+                    const cand = [...document.querySelectorAll('button,[role=button]')].find(b => {
+                        const s = ((b.getAttribute('aria-label') || '') + ' '
+                            + (b.getAttribute('data-testid') || '') + ' '
+                            + (b.textContent || '')).toLowerCase();
+                        return /attach|add photos|add files|upload|paperclip|\\bplus\\b/.test(s);
+                    });
+                    if (cand) { cand.click(); return true; }
+                    return false;
+                }"""
+            ))
+        except Exception as e:
+            log.debug(f"Attach-button click failed: {e}")
+            return False
 
     def _extract_thread_id(self) -> str:
         """Extract the thread/conversation ID from the current URL."""
