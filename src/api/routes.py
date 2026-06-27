@@ -34,6 +34,7 @@ from src.browser.manager import BrowserManager
 from src.chatgpt.client import ChatGPTClient
 from src.chatgpt.model_selector import inspect_model_picker, select_model_option
 from src.claude.client import ClaudeClient
+from src.config import Config
 from src.log import setup_logging
 
 log = setup_logging("api_routes")
@@ -69,11 +70,13 @@ def _get_browser() -> BrowserManager:
 
 def _is_allowed_chat_url(url: str) -> bool:
     parsed = urlparse(url)
-    hostname = parsed.hostname or ""
-    return (
-        parsed.scheme == "https"
-        and hostname in {"chatgpt.com", "chat.openai.com", "claude.ai"}
-    )
+    hostname = (parsed.hostname or "").lower()
+    return parsed.scheme == "https" and hostname in Config.allowed_chat_hosts()
+
+
+def _chat_url_error_detail() -> str:
+    hosts = ", ".join(sorted(Config.allowed_chat_hosts()))
+    return f"URL must be https and host must be one of: {hosts}"
 
 
 def _build_response(result) -> ChatResponse:
@@ -155,10 +158,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
         try:
             if req.target_url:
                 if not _is_allowed_chat_url(req.target_url):
-                    detail = (
-                        "URL must be https://chatgpt.com, "
-                        "https://chat.openai.com, or https://claude.ai"
-                    )
+                    detail = _chat_url_error_detail()
                     raise HTTPException(status_code=400, detail=detail)
                 await _get_browser().navigate(req.target_url)
             await _select_chatgpt_model(client, req.model, req.intensity)
@@ -244,12 +244,9 @@ async def list_threads() -> ThreadListResponse:
 
 @router.post("/navigate", response_model=NavigationResponse)
 async def navigate(req: NavigationRequest) -> NavigationResponse:
-    """Navigate the current browser session to a ChatGPT/Claude URL."""
+    """Navigate the current browser session to an allowed UI chat-agent URL."""
     if not _is_allowed_chat_url(req.url):
-        detail = (
-            "URL must be https://chatgpt.com, "
-            "https://chat.openai.com, or https://claude.ai"
-        )
+        detail = _chat_url_error_detail()
         raise HTTPException(status_code=400, detail=detail)
     browser = _get_browser()
     log.info(f"POST /navigate — {req.url}")

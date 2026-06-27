@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 _CODE_ROOT = Path(__file__).resolve().parent.parent
@@ -46,6 +47,29 @@ class Config:
     CHATGPT_URL: str = os.getenv("CHATGPT_URL", "https://chatgpt.com")
     CLAUDE_URL: str = os.getenv("CLAUDE_URL", "https://claude.ai")
 
+
+    # Browser navigation safety. Defaults cover current providers; extra
+    # UI-agent hosts can be added as comma-separated hostnames/URLs.
+    CHAT_AGENT_ALLOWED_HOSTS: str = os.getenv("CHAT_AGENT_ALLOWED_HOSTS", "")
+
+    @staticmethod
+    def _hostname_from_url_or_host(value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            return ""
+        parsed = urlparse(stripped if "://" in stripped else f"https://{stripped}")
+        return (parsed.hostname or "").lower()
+
+    @classmethod
+    def allowed_chat_hosts(cls) -> set[str]:
+        """Return HTTPS hosts the browser session may navigate to."""
+        defaults = (cls.CHATGPT_URL, cls.CLAUDE_URL, "chatgpt.com", "chat.openai.com", "claude.ai")
+        configured = tuple(cls.CHAT_AGENT_ALLOWED_HOSTS.split(","))
+        return {
+            host
+            for host in (cls._hostname_from_url_or_host(item) for item in (*defaults, *configured))
+            if host
+        }
     # Provider selection: "chatgpt" or "claude"
     PROVIDER: str = os.getenv("PROVIDER", "chatgpt").lower()
     DEFAULT_MODEL: str = os.getenv("CATGPT_MODEL", "gpt-5.5-pro")
