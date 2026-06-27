@@ -320,7 +320,7 @@ Tool calling is implemented via prompt engineering: tool definitions are injecte
 - **Stateless request contract** - Clients should send the full `messages`/`input` needed for each request. The browser thread has context, but the gateway may start a fresh chat after several turns to avoid UI degradation; delta-only context requires an explicit gateway-managed conversation id and fallback when fresh-chat rotation happens.
 - **Session expiry** - Browser sessions expire after days/weeks. Re-login via noVNC or `first_login.py`.
 - **UI changes** - If Claude or ChatGPT update their HTML, selectors may need updating. All selectors are centralized in `selectors.py` for easy fixes.
-- **Tool calling** - Works via prompt-engineered JSON plus local parser normalization, not native API. Forced tool calls return OpenAI-compatible tool-call shapes for Chat Completions and Responses API; complex schemas may occasionally need a retry.
+- **Tool calling** - Prompt-engineered JSON, not a native tool API. Forced/required `tool_choice` is framed as a structured-output schema (ChatGPT refuses to "fake" tool calls under tool-call language), with a bounded one-turn correction retry and invalid-escape repair for shell commands. Returns OpenAI-compatible `tool_calls` (Chat Completions) and `function_call` (Responses API). `auto` stays free to answer directly. Tool calling is best-effort: very complex argument schemas may still occasionally miss.
 
 ---
 

@@ -513,39 +513,87 @@ def _build_tool_protocol_suffix(tool_choice: str | dict | None = None) -> str:
     """Build a final reminder appended after the user's request on tool turns."""
     forced_tool_name = _forced_tool_name_from_choice(tool_choice)
     if forced_tool_name:
-        return f"""FINAL TOOL-CALL PROTOCOL REMINDER:
-You must call `{forced_tool_name}` now.
-Your entire next response must be ONLY valid raw JSON with this shape:
+        return f"""FINAL RESPONSE FORMAT:
+Respond with ONLY a raw JSON object — no Markdown, no prose, no language label — using exactly this schema:
 
 {{"tool_calls":[{{"name":"{forced_tool_name}","arguments":{{}}}}]}}
 
-Rules:
-- No Markdown code fence.
-- No language label such as JSON.
-- No prose.
-- No ellipsis, placeholders, comments, or trailing commas.
-- `arguments` must be a valid JSON object matching the function schema.
-- Do not answer from memory or use native ChatGPT browsing/search/tools."""
+- `arguments` is a JSON object populated with real values from the request and the schema for `{forced_tool_name}`.
+- No placeholders, ellipsis, comments, or trailing commas.
+- Derive the answer solely from the request above; do not use built-in web search or other assistants."""
 
     if tool_choice == "required":
-        return """FINAL TOOL-CALL PROTOCOL REMINDER:
-You must call at least one available function now.
-Your entire next response must be ONLY a valid raw JSON object with a `tool_calls` array.
-
-Rules:
-- No Markdown code fence.
-- No language label such as JSON.
-- No prose.
-- No ellipsis, placeholders, comments, or trailing commas.
-- Each tool call must use the exact `name` of one available function.
-- `arguments` must be a valid JSON object matching that function's schema.
-- Do not answer from memory or use native ChatGPT browsing/search/tools."""
+        return """FINAL RESPONSE FORMAT:
+Respond with ONLY a raw JSON object — no Markdown, no prose, no language label — containing a single `tool_calls` array.
+Each array item is an object with a `name` field (one of the available names listed above, never empty) and an `arguments` field (a JSON object of real values matching that name's schema).
+Escape every double-quote that appears inside a string value, prefer single quotes inside shell commands, and include no placeholders, ellipsis, comments, or trailing commas.
+Derive the answer solely from the request above; do not use built-in web search or other assistants."""
 
     return """FINAL TOOL-CALL PROTOCOL REMINDER:
 The available functions above are the caller's external CLI tools.
 If any function is relevant to the user's last request, output ONLY a JSON tool-call code block.
 Use plain text only when no function is relevant.
 Do not use native ChatGPT browsing/search/tools instead of these functions."""
+
+
+_VALID_JSON_ESCAPE = frozenset('"\\/' + "bfnrtu")
+
+
+def _repair_json_escapes(text: str) -> str:
+    """Drop backslashes that introduce invalid JSON escapes (e.g. shell `\\'`).
+
+    Runs only as a fallback when strict `json.loads` fails, on already-extracted
+    tool-call candidates. The walk tracks JSON string context and consumes each
+    backslash as part of its escape pair, so legitimate `\\\\` and `\\"` survive
+    while stray `\\'`, `\\d`, etc. (common from shell commands) normalize to the
+    following character. Valid JSON passes through byte-for-byte.
+    """
+    out: list[str] = []
+    in_string = False
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if not in_string:
+            if c == '"':
+                in_string = True
+            out.append(c)
+            i += 1
+            continue
+        if c != "\\":
+            if c == '"':
+                in_string = False
+            out.append(c)
+            i += 1
+            continue
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if nxt in _VALID_JSON_ESCAPE:
+            out.append(c)
+            out.append(nxt)
+        else:
+            out.append(nxt)
+        i += 2
+    return "".join(out)
+
+
+def _json_loads_tolerant(candidate: str) -> tuple[dict, str] | None:
+    """Strict JSON load with a one-shot invalid-escape repair fallback.
+
+    Returns (parsed_object, string_that_parsed) or None. The returned string is
+    the repaired candidate when repair was needed, so downstream re-serialization
+    stays consistent.
+    """
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        repaired = _repair_json_escapes(candidate)
+        if repaired == candidate:
+            return None
+        try:
+            parsed = json.loads(repaired)
+        except json.JSONDecodeError:
+            return None
+        return (parsed, repaired) if isinstance(parsed, dict) else None
+    return (parsed, candidate) if isinstance(parsed, dict) else None
 
 
 def _extract_json_object(text: str, anchor: str = "tool_calls") -> str | None:
@@ -561,12 +609,9 @@ def _extract_json_object(text: str, anchor: str = "tool_calls") -> str | None:
     for m in re.finditer(r"```(?:json)?\s*\n?([\s\S]*?)\n?\s*```", text):
         candidate = m.group(1).strip()
         if anchor in candidate:
-            try:
-                parsed = json.loads(candidate)
-                if anchor in parsed:
-                    return candidate
-            except json.JSONDecodeError:
-                continue
+            loaded = _json_loads_tolerant(candidate)
+            if loaded and anchor in loaded[0]:
+                return loaded[1]
 
     # Strategy 2: locate anchor, walk to balanced braces
     search_key = f'"{anchor}"'
@@ -600,11 +645,8 @@ def _extract_json_object(text: str, anchor: str = "tool_calls") -> str | None:
                 depth -= 1
                 if depth == 0:
                     candidate = text[start : i + 1]
-                    try:
-                        json.loads(candidate)
-                        return candidate
-                    except json.JSONDecodeError:
-                        return None
+                    loaded = _json_loads_tolerant(candidate)
+                    return loaded[1] if loaded else None
         i += 1
 
     return None
@@ -624,11 +666,11 @@ def _parse_tool_calls(
     if not json_str:
         return None
 
-    try:
-        parsed = json.loads(json_str)
-    except json.JSONDecodeError:
+    loaded = _json_loads_tolerant(json_str)
+    if not loaded:
         log.debug(f"Failed to parse tool call JSON: {json_str[:200]}")
         return None
+    parsed = loaded[0]
 
     if "tool_calls" not in parsed or not isinstance(parsed["tool_calls"], list):
         return None
@@ -1021,6 +1063,42 @@ async def _run_completion(request: ChatCompletionRequest) -> ChatCompletionRespo
                 finish_reason = "tool_calls"
                 # When the model calls tools, content should be null
                 response_text = None
+
+        # ── Forced-tool retry (bounded to one correction turn) ──────────
+        # A forced/required tool call that failed to parse (refusal, malformed
+        # JSON, or embedded unescaped quotes) gets a single short correction in
+        # the same thread. Parse only the retry text; never after a tool result.
+        if (
+            not tool_calls
+            and force_tool_protocol
+            and not any(msg.role == "tool" for msg in request.messages)
+        ):
+            forced_name = _forced_tool_name_from_choice(request.tool_choice)
+            skeleton = (
+                f'{{"tool_calls":[{{"name":"{forced_name}","arguments":{{}}}}]}}'
+                if forced_name
+                else '{"tool_calls":[{"name":"<an available name>","arguments":{}}]}'
+            )
+            correction = (
+                "Your previous response was not a valid JSON object. Ignore it "
+                "and reply with ONLY the corrected raw JSON object, exactly this "
+                f"shape: {skeleton}. Escape every double-quote inside string "
+                "values, prefer single quotes inside shell commands, and output "
+                "no prose and no code fence."
+            )
+            try:
+                retry_result = await client.send_message(correction)
+                retry_text = retry_result.message if retry_result else None
+                if retry_text:
+                    retry_calls = _parse_tool_calls(retry_text, request.tools)
+                    if retry_calls:
+                        tool_calls = retry_calls
+                        finish_reason = "tool_calls"
+                        response_text = None
+                        elapsed_ms = int((time.time() - start_time) * 1000)
+                        log.info("Forced tool-call retry succeeded after parse miss")
+            except Exception as e:
+                log.warning(f"Forced tool-call retry send failed: {e}")
 
         # ── Build response ──────────────────────────────────
         prompt_tokens = _estimate_tokens(prompt)
@@ -1567,6 +1645,40 @@ async def create_response(request: ResponsesRequest):
             tool_calls = _parse_tool_calls(response_text, chat_tools)
             if tool_calls:
                 response_text = None
+
+        # ── Forced-tool retry (bounded to one correction turn) ──────────
+        # Mirror of the chat-completions retry: a forced/required tool call
+        # that failed to parse gets a single short correction in the same
+        # thread. Parse only the retry text; never after a tool result.
+        if (
+            not tool_calls
+            and force_tool_protocol
+            and not any(msg.role == "tool" for msg in messages)
+        ):
+            forced_name = _forced_tool_name_from_choice(request.tool_choice)
+            skeleton = (
+                f'{{"tool_calls":[{{"name":"{forced_name}","arguments":{{}}}}]}}'
+                if forced_name
+                else '{"tool_calls":[{"name":"<an available name>","arguments":{}}]}'
+            )
+            correction = (
+                "Your previous response was not a valid JSON object. Ignore it "
+                "and reply with ONLY the corrected raw JSON object, exactly this "
+                f"shape: {skeleton}. Escape every double-quote inside string "
+                "values, prefer single quotes inside shell commands, and output "
+                "no prose and no code fence."
+            )
+            try:
+                retry_result = await client.send_message(correction)
+                retry_text = retry_result.message if retry_result else None
+                if retry_text:
+                    retry_calls = _parse_tool_calls(retry_text, chat_tools)
+                    if retry_calls:
+                        tool_calls = retry_calls
+                        response_text = None
+                        log.info("Forced tool-call retry succeeded after parse miss")
+            except Exception as e:
+                log.warning(f"Forced tool-call retry send failed: {e}")
 
         # ── Build response ──────────────────────────────────
         prompt_tokens = _estimate_tokens(prompt)
