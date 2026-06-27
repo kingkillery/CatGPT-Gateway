@@ -13,12 +13,12 @@ class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, description="The message to send")
     model: Optional[str] = Field(None, description="Optional browser model label to select first")
     intensity: Optional[str] = Field(None, description="Optional reasoning intensity label/hint")
-    target_url: Optional[str] = Field(None, description="Optional ChatGPT/Claude URL to open first")
+    target_url: Optional[str] = Field(None, description="Optional allowed UI chat-agent URL to open first")
 
 
 class NavigationRequest(BaseModel):
     """Request body for navigating the browser session."""
-    url: str = Field(..., min_length=1, description="ChatGPT or Claude URL to open")
+    url: str = Field(..., min_length=1, description="Allowed UI chat-agent URL to open")
 
 
 class NavigationResponse(BaseModel):

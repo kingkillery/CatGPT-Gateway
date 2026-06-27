@@ -258,6 +258,7 @@ Key settings:
 | `BROWSER_DATA_DIR` | `./browser_data` | Browser profile directory (keeps your login) |
 | `API_TOKEN` | `dummy123` | Bearer token for API authentication |
 | `API_PORT` | `8000` | Port the API server listens on |
+| `CHAT_AGENT_ALLOWED_HOSTS` | empty | Extra comma-separated HTTPS hosts allowed for `/chat target_url` and `/navigate` when onboarding non-ChatGPT UI agents |
 | `HEADLESS` | `false` | Run browser without display (not recommended) |
 
 > See [.env.example](.env.example) for all available settings with descriptions.
