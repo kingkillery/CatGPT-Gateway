@@ -42,6 +42,7 @@ services:
 
       # Provider: "chatgpt" or "claude"
       - PROVIDER=chatgpt
+      - CATGPT_MODEL=gpt-5.5-pro
 
       # ChatGPT
       - CHATGPT_URL=https://chatgpt.com

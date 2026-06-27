@@ -42,6 +42,7 @@ class Config:
 
     # Provider selection: "chatgpt" or "claude"
     PROVIDER: str = os.getenv("PROVIDER", "chatgpt").lower()
+    DEFAULT_MODEL: str = os.getenv("CATGPT_MODEL", "gpt-5.5-pro")
 
     @classmethod
     def provider_url(cls) -> str:

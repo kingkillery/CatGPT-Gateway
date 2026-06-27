@@ -124,7 +124,9 @@ def _increment_thread_count() -> None:
 
 
 def _get_model_id() -> str:
-    """Return model ID based on active provider."""
+    """Return the configured OpenAI-compatible model ID."""
+    if Config.DEFAULT_MODEL:
+        return Config.DEFAULT_MODEL
     if Config.PROVIDER == "claude":
         return "claude-browser"
     return "catgpt-browser"
