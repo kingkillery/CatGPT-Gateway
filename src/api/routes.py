@@ -12,19 +12,27 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException
 
 from src.api.schemas import (
+    BrowserModelOptionsResponse,
     ChatRequest,
     ChatResponse,
     ImageInfoResponse,
+    ModelOptionResponse,
+    ModelSelectionRequest,
+    ModelSelectionResponse,
+    NavigationRequest,
+    NavigationResponse,
     StatusResponse,
     ThreadInfo,
     ThreadListResponse,
 )
 from src.browser.manager import BrowserManager
 from src.chatgpt.client import ChatGPTClient
+from src.chatgpt.model_selector import inspect_model_picker, select_model_option
 from src.claude.client import ClaudeClient
 from src.log import setup_logging
 
@@ -47,10 +55,25 @@ def set_client(client: ChatGPTClient | ClaudeClient, browser: BrowserManager) ->
     _browser = browser
 
 
-def _get_client():
+def _get_client() -> ChatGPTClient | ClaudeClient:
     if _client is None:
         raise HTTPException(status_code=503, detail="Client not initialized")
     return _client
+
+
+def _get_browser() -> BrowserManager:
+    if _browser is None:
+        raise HTTPException(status_code=503, detail="Browser not initialized")
+    return _browser
+
+
+def _is_allowed_chat_url(url: str) -> bool:
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+    return (
+        parsed.scheme == "https"
+        and hostname in {"chatgpt.com", "chat.openai.com", "claude.ai"}
+    )
 
 
 def _build_response(result) -> ChatResponse:
@@ -73,6 +96,52 @@ def _build_response(result) -> ChatResponse:
     )
 
 
+def _model_options_response(options) -> list[ModelOptionResponse]:
+    return [
+        ModelOptionResponse(
+            label=option.label,
+            selected=option.selected,
+            disabled=option.disabled,
+            source=option.source,
+        )
+        for option in options
+    ]
+
+
+def _message_with_intensity_hint(message: str, intensity: str | None) -> str:
+    if not intensity:
+        return message
+    return (
+        f"[Requested reasoning intensity: {intensity}. Use the closest available "
+        f"mode/tool behavior for this answer.]\\n\\n{message}"
+    )
+
+
+async def _select_chatgpt_model(
+    client: ChatGPTClient | ClaudeClient,
+    model: str | None,
+    intensity: str | None,
+) -> ModelSelectionResponse:
+    if not model and not intensity:
+        return ModelSelectionResponse(matched=True, reason="no selection requested")
+    if not isinstance(client, ChatGPTClient):
+        raise HTTPException(status_code=400, detail="Browser model selection is only implemented for ChatGPT")
+    selection = await select_model_option(client.page, model=model, intensity=intensity)
+    response = ModelSelectionResponse(
+        matched=selection.matched,
+        selected=selection.selected,
+        reason=selection.reason,
+        options=_model_options_response(selection.options),
+    )
+    if model and not selection.matched:
+        raise HTTPException(status_code=400, detail=response.model_dump())
+    if selection.matched and selection.selected:
+        log.info(f"Selected ChatGPT model option: {selection.selected}")
+    elif intensity:
+        log.warning(f"No ChatGPT model option matched intensity '{intensity}'; using prompt hint")
+    return response
+
+
 # ── Chat ────────────────────────────────────────────────────────
 
 
@@ -84,8 +153,20 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
     async with _lock:
         try:
-            result = await client.send_message(req.message)
+            if req.target_url:
+                if not _is_allowed_chat_url(req.target_url):
+                    detail = (
+                        "URL must be https://chatgpt.com, "
+                        "https://chat.openai.com, or https://claude.ai"
+                    )
+                    raise HTTPException(status_code=400, detail=detail)
+                await _get_browser().navigate(req.target_url)
+            await _select_chatgpt_model(client, req.model, req.intensity)
+            message = _message_with_intensity_hint(req.message, req.intensity)
+            result = await client.send_message(message)
             return _build_response(result)
+        except HTTPException:
+            raise
         except Exception as e:
             log.error(f"Chat error: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
@@ -104,8 +185,12 @@ async def chat_in_thread(thread_id: str, req: ChatRequest) -> ChatResponse:
             if current_tid != thread_id:
                 await client.navigate_to_thread(thread_id)
 
-            result = await client.send_message(req.message)
+            await _select_chatgpt_model(client, req.model, req.intensity)
+            message = _message_with_intensity_hint(req.message, req.intensity)
+            result = await client.send_message(message)
             return _build_response(result)
+        except HTTPException:
+            raise
         except Exception as e:
             log.error(f"Thread chat error: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
@@ -120,8 +205,12 @@ async def new_thread(req: ChatRequest) -> ChatResponse:
     async with _lock:
         try:
             await client.new_chat()
-            result = await client.send_message(req.message)
+            await _select_chatgpt_model(client, req.model, req.intensity)
+            message = _message_with_intensity_hint(req.message, req.intensity)
+            result = await client.send_message(message)
             return _build_response(result)
+        except HTTPException:
+            raise
         except Exception as e:
             log.error(f"New thread error: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
@@ -148,6 +237,66 @@ async def list_threads() -> ThreadListResponse:
             log.error(f"Threads list error: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
 
+
+
+# ── Browser session ─────────────────────────────────────────────
+
+
+@router.post("/navigate", response_model=NavigationResponse)
+async def navigate(req: NavigationRequest) -> NavigationResponse:
+    """Navigate the current browser session to a ChatGPT/Claude URL."""
+    if not _is_allowed_chat_url(req.url):
+        detail = (
+            "URL must be https://chatgpt.com, "
+            "https://chat.openai.com, or https://claude.ai"
+        )
+        raise HTTPException(status_code=400, detail=detail)
+    browser = _get_browser()
+    log.info(f"POST /navigate — {req.url}")
+
+    async with _lock:
+        try:
+            await browser.navigate(req.url)
+            return NavigationResponse(url=browser.page.url)
+        except Exception as e:
+            log.error(f"Navigate error: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/models/browser", response_model=BrowserModelOptionsResponse)
+async def browser_model_options() -> BrowserModelOptionsResponse:
+    """Inspect visible model options in the current ChatGPT browser session."""
+    client = _get_client()
+    if not isinstance(client, ChatGPTClient):
+        raise HTTPException(status_code=400, detail="Browser model inspection is only implemented for ChatGPT")
+    log.info("GET /models/browser")
+
+    async with _lock:
+        try:
+            state = await inspect_model_picker(client.page)
+            return BrowserModelOptionsResponse(
+                opener_label=state.opener_label,
+                options=_model_options_response(state.options),
+            )
+        except Exception as e:
+            log.error(f"Model inspection error: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/model/select", response_model=ModelSelectionResponse)
+async def select_browser_model(req: ModelSelectionRequest) -> ModelSelectionResponse:
+    """Select a model option in the current ChatGPT browser session."""
+    client = _get_client()
+    log.info(f"POST /model/select — model={req.model}, intensity={req.intensity}")
+
+    async with _lock:
+        try:
+            return await _select_chatgpt_model(client, req.model, req.intensity)
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.error(f"Model selection error: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
 
 # ── Status ──────────────────────────────────────────────────────
 
