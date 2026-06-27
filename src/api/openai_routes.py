@@ -425,11 +425,16 @@ def _build_tool_system_prompt(
             "Do NOT answer the question yourself — always output tool calls."
         )
     else:
-        # "auto" or None — model decides
+        # "auto" or None — model decides, but prefer the caller's external
+        # functions over the provider UI's built-in browsing/tools/memory.
         decision = (
-            "If the user's request can be fulfilled or assisted by one or more "
-            "of the available functions, call the appropriate tool(s). "
-            "If none of the tools are relevant, answer the user normally in plain text."
+            "Treat the available functions as your only external tools. "
+            "If the user's request can be fulfilled or materially assisted by "
+            "one or more available functions — including current/exact data, "
+            "file or code inspection, code execution, browser/web actions, "
+            "or side effects — call the appropriate tool(s). "
+            "Do not answer from memory when a relevant function can do the work. "
+            "Answer normally in plain text only when no function is relevant."
         )
 
     # ── Provider-specific prompt framing ──
@@ -475,7 +480,8 @@ Rules:
 2. You may call multiple functions in one response by adding them to the array.
 3. Use the exact parameter names and types from each function's schema.
 4. When a follow-up message contains tool results, summarize them naturally for the user. Do NOT call tools again for the same request.
-5. Do not refuse or say tools are unavailable — they are available through this interface.
+5. Do not use native ChatGPT browsing, search, connectors, uploads, or code interpreter for toolable work — use this JSON tool-call protocol.
+6. Do not refuse or say tools are unavailable — they are available through this interface.
 
 Available functions:
 {tools_json}
@@ -490,6 +496,56 @@ Example — multiple tools:
 {{"tool_calls": [{{"name": "weather_forecast", "arguments": {{"city": "Tokyo", "date": "today"}}}}, {{"name": "calculate_expression", "arguments": {{"expression": "2+2"}}}}]}}
 ```
 """
+
+
+def _forced_tool_name_from_choice(tool_choice: str | dict | None) -> str | None:
+    """Return the forced function name from OpenAI tool_choice, if any."""
+    if not isinstance(tool_choice, dict):
+        return None
+    function = tool_choice.get("function")
+    if not isinstance(function, dict):
+        return None
+    name = function.get("name")
+    return name if isinstance(name, str) and name else None
+
+
+def _build_tool_protocol_suffix(tool_choice: str | dict | None = None) -> str:
+    """Build a final reminder appended after the user's request on tool turns."""
+    forced_tool_name = _forced_tool_name_from_choice(tool_choice)
+    if forced_tool_name:
+        return f"""FINAL TOOL-CALL PROTOCOL REMINDER:
+You must call `{forced_tool_name}` now.
+Your entire next response must be ONLY valid raw JSON with this shape:
+
+{{"tool_calls":[{{"name":"{forced_tool_name}","arguments":{{}}}}]}}
+
+Rules:
+- No Markdown code fence.
+- No language label such as JSON.
+- No prose.
+- No ellipsis, placeholders, comments, or trailing commas.
+- `arguments` must be a valid JSON object matching the function schema.
+- Do not answer from memory or use native ChatGPT browsing/search/tools."""
+
+    if tool_choice == "required":
+        return """FINAL TOOL-CALL PROTOCOL REMINDER:
+You must call at least one available function now.
+Your entire next response must be ONLY a valid raw JSON object with a `tool_calls` array.
+
+Rules:
+- No Markdown code fence.
+- No language label such as JSON.
+- No prose.
+- No ellipsis, placeholders, comments, or trailing commas.
+- Each tool call must use the exact `name` of one available function.
+- `arguments` must be a valid JSON object matching that function's schema.
+- Do not answer from memory or use native ChatGPT browsing/search/tools."""
+
+    return """FINAL TOOL-CALL PROTOCOL REMINDER:
+The available functions above are the caller's external CLI tools.
+If any function is relevant to the user's last request, output ONLY a JSON tool-call code block.
+Use plain text only when no function is relevant.
+Do not use native ChatGPT browsing/search/tools instead of these functions."""
 
 
 def _extract_json_object(text: str, anchor: str = "tool_calls") -> str | None:
@@ -582,16 +638,26 @@ def _parse_tool_calls(
     result: list[ToolCall] = []
 
     for call in parsed["tool_calls"]:
-        name = call.get("name", "")
+        if not isinstance(call, dict):
+            log.warning(f"Skipping malformed tool call: {call!r}")
+            continue
+
+        function = call.get("function")
+        if isinstance(function, dict):
+            name = function.get("name", "")
+            arguments = function.get("arguments", {})
+        else:
+            name = call.get("name", "")
+            arguments = call.get("arguments", {})
+
         if name not in valid_names:
             log.warning(f"Model called unknown tool: {name}")
             continue
 
-        arguments = call.get("arguments", {})
-        if isinstance(arguments, dict):
-            arguments_str = json.dumps(arguments)
+        if isinstance(arguments, str):
+            arguments_str = arguments
         else:
-            arguments_str = str(arguments)
+            arguments_str = json.dumps(arguments)
 
         result.append(
             ToolCall(
@@ -741,24 +807,108 @@ async def create_image(
         return ImagesResponse(data=image_data_list)
 
 
-@openai_router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
-async def create_chat_completion(
-    request: ChatCompletionRequest,
-) -> ChatCompletionResponse:
-    """
-    OpenAI-compatible chat completions endpoint.
+def _sse_chunk(
+    completion_id: str,
+    model: str,
+    *,
+    delta: dict[str, Any] | None = None,
+    finish_reason: str | None = None,
+    usage: dict[str, int] | None = None,
+    choices: list[dict[str, Any]] | None = None,
+) -> str:
+    """Serialize one OpenAI ``chat.completion.chunk`` event as an SSE line."""
+    if choices is None:
+        choices = [{"index": 0, "delta": delta or {}, "finish_reason": finish_reason}]
+    payload: dict[str, Any] = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": choices,
+    }
+    if usage is not None:
+        payload["usage"] = usage
+    return f"data: {json.dumps(payload)}\n\n"
 
-    Converts the message array into a single prompt, sends it to ChatGPT
-    via browser automation, and returns an OpenAI-formatted response.
-    Supports tool/function calling via prompt injection.
+
+def _stream_chat_completion(
+    response: ChatCompletionResponse,
+    request: ChatCompletionRequest,
+) -> StreamingResponse:
+    """Wrap a fully-computed response as an OpenAI SSE stream.
+
+    The browser round-trip is atomic (there is no incremental token emission),
+    so the completed content/tool_calls are emitted as delta chunks followed by
+    the finish and ``[DONE]`` markers. This makes ``stream=true`` clients work
+    even though the reply only becomes available once generation finishes.
     """
-    # ── Validate ────────────────────────────────────────────
-    if request.stream:
-        raise HTTPException(
-            status_code=400,
-            detail="Streaming is not supported. Set stream=false or omit it.",
+    completion_id = response.id
+    model = response.model
+    choice = response.choices[0]
+    content = choice.message.content
+    tool_calls = choice.message.tool_calls
+    include_usage = bool(
+        request.stream_options and request.stream_options.include_usage
+    )
+
+    async def event_stream():
+        # 1. role chunk
+        yield _sse_chunk(
+            completion_id, model, delta={"role": "assistant", "content": ""}
         )
 
+        # 2. content / tool_calls delta
+        if tool_calls:
+            tc_serialized = [
+                {
+                    "index": i,
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for i, tc in enumerate(tool_calls)
+            ]
+            yield _sse_chunk(completion_id, model, delta={"tool_calls": tc_serialized})
+        elif content:
+            yield _sse_chunk(completion_id, model, delta={"content": content})
+
+        # 3. finish_reason chunk
+        yield _sse_chunk(completion_id, model, finish_reason=choice.finish_reason)
+
+        # 4. usage chunk (only when requested) — empty choices per OpenAI spec
+        if include_usage:
+            yield _sse_chunk(
+                completion_id,
+                model,
+                choices=[],
+                usage={
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens,
+                },
+            )
+
+        # 5. terminator
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _run_completion(request: ChatCompletionRequest) -> ChatCompletionResponse:
+    """Drive the provider browser for one chat-completion round-trip.
+
+    Shared by the streaming and non-streaming paths. Builds the prompt (injecting
+    tool definitions when present), sends it through the provider client,
+    detects/repairs prompt echo, parses any tool calls, and returns an
+    OpenAI-formatted response. The global browser lock is held for the round-trip.
+    """
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages array cannot be empty")
 
@@ -782,6 +932,16 @@ async def create_chat_completion(
             has_tool_prompt = True
 
         prompt = _build_prompt(messages)
+        force_tool_protocol = (
+            _forced_tool_name_from_choice(request.tool_choice) is not None
+            or request.tool_choice == "required"
+        )
+        if (
+            has_tool_prompt
+            and force_tool_protocol
+            and not any(msg.role == "tool" for msg in messages)
+        ):
+            prompt = f"{prompt}\n\n{_build_tool_protocol_suffix(request.tool_choice)}"
         log.info(
             f"POST /v1/chat/completions — model={request.model}, "
             f"{len(request.messages)} messages, prompt={len(prompt)} chars"
@@ -812,7 +972,7 @@ async def create_chat_completion(
         # Start a fresh conversation to avoid thread exhaustion
         await _ensure_fresh_chat()
 
-        # ── Send to ChatGPT ────────────────────────────────
+        # ── Send to provider ────────────────────────────────
         try:
             result = await client.send_message(
                 prompt,
@@ -893,6 +1053,26 @@ async def create_chat_completion(
 
         _increment_thread_count()
         return response
+
+
+@openai_router.post("/v1/chat/completions")
+async def create_chat_completion(request: ChatCompletionRequest):
+    """
+    OpenAI-compatible chat completions endpoint.
+
+    Converts the message array into a single prompt, sends it to the configured
+    provider (ChatGPT or Claude) via browser automation, and returns an
+    OpenAI-formatted response. Supports tool/function calling via prompt
+    injection.
+
+    When ``stream=true`` the response is emitted as OpenAI SSE chunks. The
+    browser round-trip is atomic, so the full reply is delivered once generation
+    completes rather than token-by-token.
+    """
+    response = await _run_completion(request)
+    if request.stream:
+        return _stream_chat_completion(response, request)
+    return response
 
 
 # ── Responses API (/v1/responses) ───────────────────────────────
@@ -1267,6 +1447,16 @@ async def create_response(request: ResponsesRequest):
                 has_tool_prompt = True
 
         prompt = _build_prompt(messages)
+        force_tool_protocol = (
+            _forced_tool_name_from_choice(request.tool_choice) is not None
+            or request.tool_choice == "required"
+        )
+        if (
+            has_tool_prompt
+            and force_tool_protocol
+            and not any(msg.role == "tool" for msg in messages)
+        ):
+            prompt = f"{prompt}\n\n{_build_tool_protocol_suffix(request.tool_choice)}"
         log.info(
             f"POST /v1/responses — model={request.model}, "
             f"input_type={'string' if isinstance(request.input, str) else 'array'}, "

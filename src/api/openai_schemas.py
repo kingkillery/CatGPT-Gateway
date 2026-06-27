@@ -68,6 +68,11 @@ class ChatMessage(BaseModel):
 # ── Request ─────────────────────────────────────────────────────
 
 
+class StreamOptions(BaseModel):
+    """Options for streaming responses (OpenAI ``stream_options`` field)."""
+    include_usage: Optional[bool] = False
+
+
 class ChatCompletionRequest(BaseModel):
     """OpenAI-compatible chat completion request body."""
     model: str = "catgpt-browser"
@@ -81,6 +86,7 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: Optional[float] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: Optional[bool] = False
+    stream_options: Optional[StreamOptions] = None
     n: Optional[int] = 1
     user: Optional[str] = None
 

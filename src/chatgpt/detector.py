@@ -339,6 +339,22 @@ async def _check_page_error(page: Page) -> str | None:
         return None
 
 
+async def _stop_button_visible(page: Page) -> bool:
+    """True if a visible stop-generating control is present (response streaming)."""
+    try:
+        return bool(await page.evaluate(
+            """() => {
+                const sel = 'button[aria-label="Stop streaming"], button[aria-label="Stop generating"], button[data-testid="stop-button"], div[data-testid="stop-button"]';
+                const el = document.querySelector(sel);
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+            }"""
+        ))
+    except Exception:
+        return False
+
+
 async def _wait_for_copy_button_or_image(
     page: Page,
     timeout_ms: int,
@@ -354,6 +370,9 @@ async def _wait_for_copy_button_or_image(
     heartbeat = 10
     next_heartbeat = heartbeat
     first_snapshot_logged = False
+    liveness_interval = Config.LIVENESS_INTERVAL_MS / 1000
+    next_liveness = liveness_interval
+    liveness_last_len = 0
 
     while elapsed * 1000 < timeout_ms:
         try:
@@ -419,6 +438,24 @@ async def _wait_for_copy_button_or_image(
             if page_error:
                 log.error(f"Page error detected while waiting: {page_error}")
                 return None
+
+        # ── Deep liveness probe (every LIVENESS_INTERVAL_MS) ─────────────
+        # Slow pro models can take many minutes to respond; confirm the
+        # generation is still progressing so a silent stall surfaces here.
+        if elapsed >= next_liveness:
+            next_liveness = elapsed + liveness_interval
+            cur_len = len(snapshot.get("text") or "")
+            grew = cur_len - liveness_last_len
+            liveness_last_len = cur_len
+            stop_visible = await _stop_button_visible(page)
+            page_err = await _check_page_error(page)
+            active = (stop_visible or grew > 0) and not page_err
+            log.info(
+                f"[liveness] {int(elapsed)}s elapsed — "
+                f"status={'active' if active else 'stalled'} "
+                f"stop_btn={stop_visible} text_delta={grew:+d} "
+                f"text_len={cur_len} page_error={page_err or 'none'}"
+            )
 
         await asyncio.sleep(poll_interval)
         elapsed += poll_interval

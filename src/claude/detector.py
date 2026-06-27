@@ -260,6 +260,9 @@ async def _wait_for_streaming_complete(
     elapsed = 0
     poll_interval = Config.POLL_INTERVAL_MS / 1000
     heartbeat = 10
+    liveness_interval = Config.LIVENESS_INTERVAL_MS / 1000
+    next_liveness = liveness_interval
+    liveness_last_len = 0
 
     while elapsed * 1000 < timeout_ms:
         snapshot = await _latest_assistant_turn_snapshot(page)
@@ -279,6 +282,22 @@ async def _wait_for_streaming_complete(
         if elapsed > 0 and elapsed % heartbeat == 0:
             log.debug(f"Still streaming... ({int(elapsed)}s)")
             await idle_mouse_movement(page)
+
+        # ── Deep liveness probe (every LIVENESS_INTERVAL_MS) ─────────────
+        # Slow pro models can take many minutes to respond; confirm the
+        # generation is still progressing so a silent stall surfaces here.
+        if elapsed >= next_liveness:
+            next_liveness = elapsed + liveness_interval
+            cur_len = len(snapshot.get("text") or "")
+            grew = cur_len - liveness_last_len
+            liveness_last_len = cur_len
+            streaming = bool(snapshot.get("isStreaming"))
+            active = streaming or grew > 0
+            log.info(
+                f"[liveness] {int(elapsed)}s elapsed — "
+                f"status={'active' if active else 'stalled'} "
+                f"streaming={streaming} text_delta={grew:+d} text_len={cur_len}"
+            )
 
         await asyncio.sleep(poll_interval)
         elapsed += poll_interval

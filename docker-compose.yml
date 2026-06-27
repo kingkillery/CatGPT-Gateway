@@ -51,8 +51,9 @@ services:
       - CLAUDE_URL=https://claude.ai
 
       # Timeouts
-      - RESPONSE_TIMEOUT=120000
+      - RESPONSE_TIMEOUT=2100000
       - SELECTOR_TIMEOUT=10000
+      - LIVENESS_INTERVAL_MS=180000
 
       # Human simulation
       - TYPING_SPEED_MIN=50

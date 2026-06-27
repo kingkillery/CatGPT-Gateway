@@ -192,6 +192,8 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 
 Full round-trip tool calling works with both providers. Define tools, let the model call them, send results back.
 
+For CLI agents with skills, the caller should select and load required skills before asking the model to continue. For example, if Python edits require `skill://programming`, the caller should either preflight the `read(skill://programming)` tool itself or force a `read` tool call and then send the returned skill text as the next tool-result message. The gateway validates and normalizes tool-call shapes; it does not silently rewrite model-selected tool arguments.
+
 ```python
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, ToolMessage
@@ -312,12 +314,13 @@ Tool calling is implemented via prompt engineering: tool definitions are injecte
 
 ## Known Limitations
 
-- **No streaming** - Responses are returned all at once after completion. `stream=true` returns a 400 error.
+- **Streaming is atomic** - `stream=true` is supported and returns OpenAI SSE chunks, but since the browser round-trip completes before any text is available, the full reply is emitted at once (not token-by-token) followed by the finish and `[DONE]` markers.
 - **Single concurrency** - One request at a time (browser is single-threaded). Requests are queued.
-- **Response time** - Each request takes 5-30s depending on response length (real browser round-trip).
+- **Response time** - Most requests take 5-30s, but pro-level models can take up to ~30 minutes. The Docker default `RESPONSE_TIMEOUT` is 35 minutes, with liveness probes logged every 3 minutes while generation is active.
+- **Stateless request contract** - Clients should send the full `messages`/`input` needed for each request. The browser thread has context, but the gateway may start a fresh chat after several turns to avoid UI degradation; delta-only context requires an explicit gateway-managed conversation id and fallback when fresh-chat rotation happens.
 - **Session expiry** - Browser sessions expire after days/weeks. Re-login via noVNC or `first_login.py`.
 - **UI changes** - If Claude or ChatGPT update their HTML, selectors may need updating. All selectors are centralized in `selectors.py` for easy fixes.
-- **Tool calling** - Works via prompt engineering, not native API. Reliable for 1-7 tools. Very complex schemas may occasionally need a retry.
+- **Tool calling** - Works via prompt-engineered JSON plus local parser normalization, not native API. Forced tool calls return OpenAI-compatible tool-call shapes for Chat Completions and Responses API; complex schemas may occasionally need a retry.
 
 ---
 

@@ -52,7 +52,7 @@ class Config:
         return cls.CHATGPT_URL
 
     # Timeouts (ms)
-    RESPONSE_TIMEOUT: int = int(os.getenv("RESPONSE_TIMEOUT", "120000"))
+    RESPONSE_TIMEOUT: int = int(os.getenv("RESPONSE_TIMEOUT", "2100000"))
     SELECTOR_TIMEOUT: int = int(os.getenv("SELECTOR_TIMEOUT", "10000"))
 
     # Human simulation (ms)
@@ -62,6 +62,9 @@ class Config:
     THINKING_PAUSE_MAX: int = int(os.getenv("THINKING_PAUSE_MAX", "1500"))
     # Completion poll interval — how often to check if response is ready (ms)
     POLL_INTERVAL_MS: int = int(os.getenv("POLL_INTERVAL_MS", "300"))
+    # Deep liveness probe interval for slow pro models that can take many
+    # minutes to respond — verifies generation is still progressing (ms).
+    LIVENESS_INTERVAL_MS: int = int(os.getenv("LIVENESS_INTERVAL_MS", "180000"))
 
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "DEBUG")
