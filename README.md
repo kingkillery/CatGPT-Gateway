@@ -23,8 +23,8 @@
   <img src="https://img.shields.io/badge/providers-Claude_%7C_ChatGPT-purple?style=flat-square" alt="Providers" />
   <img src="https://img.shields.io/badge/API-OpenAI_compatible-green?style=flat-square" alt="OpenAI Compatible" />
   <img src="https://img.shields.io/badge/docker-ready-blue?style=flat-square" alt="Docker" />
-  <img src="https://img.shields.io/github/license/GautamVhavle/CatGPT-Gateway?style=flat-square" alt="MIT License" />
-  <img src="https://img.shields.io/github/stars/GautamVhavle/CatGPT-Gateway?style=flat-square" alt="Stars" />
+  <img src="https://img.shields.io/github/license/kingkillery/CatGPT-Gateway?style=flat-square" alt="MIT License" />
+  <img src="https://img.shields.io/github/stars/kingkillery/CatGPT-Gateway?style=flat-square" alt="Stars" />
 </p>
 
 ---
@@ -97,7 +97,7 @@ Use your existing OpenAI account (free or Plus). The gateway connects to `chatgp
 
 ```bash
 # Clone the repo
-git clone https://github.com/GautamVhavle/CatGPT-Gateway.git
+git clone https://github.com/kingkillery/CatGPT-Gateway.git
 cd CatGPT-Gateway
 
 # Copy the example env and pick your provider
@@ -121,7 +121,7 @@ curl -H "Authorization: Bearer dummy123" http://localhost:8000/v1/models
 
 ```bash
 # Clone and setup
-git clone https://github.com/GautamVhavle/CatGPT-Gateway.git
+git clone https://github.com/kingkillery/CatGPT-Gateway.git
 cd CatGPT-Gateway
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
@@ -337,7 +337,7 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 <p align="center">
   If you find this project useful, consider giving it a star. It helps others discover it and keeps the project going.<br/>
-  <a href="https://github.com/GautamVhavle/CatGPT-Gateway">
-    <img src="https://img.shields.io/github/stars/GautamVhavle/CatGPT-Gateway?style=social" alt="Star on GitHub" />
+  <a href="https://github.com/kingkillery/CatGPT-Gateway">
+    <img src="https://img.shields.io/github/stars/kingkillery/CatGPT-Gateway?style=social" alt="Star on GitHub" />
   </a>
 </p>
