@@ -3,13 +3,54 @@ Pydantic request/response schemas for the API.
 """
 
 from __future__ import annotations
+from typing import Optional
 
 from pydantic import BaseModel, Field
 
 
 class ChatRequest(BaseModel):
     """Request body for sending a message."""
-    message: str = Field(..., min_length=1, description="The message to send to ChatGPT")
+    message: str = Field(..., min_length=1, description="The message to send")
+    model: Optional[str] = Field(None, description="Optional browser model label to select first")
+    intensity: Optional[str] = Field(None, description="Optional reasoning intensity label/hint")
+    target_url: Optional[str] = Field(None, description="Optional ChatGPT/Claude URL to open first")
+
+
+class NavigationRequest(BaseModel):
+    """Request body for navigating the browser session."""
+    url: str = Field(..., min_length=1, description="ChatGPT or Claude URL to open")
+
+
+class NavigationResponse(BaseModel):
+    """Response body after browser navigation."""
+    url: str = Field("", description="Current browser URL after navigation")
+
+
+class ModelOptionResponse(BaseModel):
+    """One visible model-picker option."""
+    label: str
+    selected: bool = False
+    disabled: bool = False
+    source: str = ""
+
+
+class BrowserModelOptionsResponse(BaseModel):
+    """Visible model-picker options from the browser session."""
+    opener_label: str = ""
+    options: list[ModelOptionResponse] = Field(default_factory=list)
+
+
+class ModelSelectionRequest(BaseModel):
+    """Request body for selecting a browser model option."""
+    model: Optional[str] = Field(None, description="Browser model label to select")
+    intensity: Optional[str] = Field(None, description="Reasoning intensity label/hint to select")
+
+class ModelSelectionResponse(BaseModel):
+    """Result after selecting a browser model option."""
+    matched: bool = False
+    selected: str = ""
+    reason: str = ""
+    options: list[ModelOptionResponse] = Field(default_factory=list)
 
 
 class ImageInfoResponse(BaseModel):

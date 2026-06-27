@@ -25,6 +25,12 @@ load_dotenv(_CWD / ".env")
 load_dotenv(_PROJECT_ROOT / ".env")
 
 
+def _optional_int(value: str | None) -> int | None:
+    if value is None or value.strip() == "":
+        return None
+    return int(value)
+
+
 class Config:
     """All project settings in one place."""
 
@@ -81,9 +87,26 @@ class Config:
     # VNC
     VNC_PASSWORD: str = os.getenv("VNC_PASSWORD", "catgpt")
 
-    # Viewport base (will be jittered ±20px)
-    VIEWPORT_WIDTH: int = 1280
-    VIEWPORT_HEIGHT: int = 720
+    # Viewport base (will be jittered ±20px), bounded to the visible display.
+    VIEWPORT_WIDTH: int = int(os.getenv("VIEWPORT_WIDTH", "1280"))
+    VIEWPORT_HEIGHT: int = int(os.getenv("VIEWPORT_HEIGHT", "720"))
+    DISPLAY_WIDTH: int | None = _optional_int(os.getenv("DISPLAY_WIDTH"))
+    DISPLAY_HEIGHT: int | None = _optional_int(os.getenv("DISPLAY_HEIGHT"))
+    MIN_VIEWPORT_WIDTH: int = int(os.getenv("MIN_VIEWPORT_WIDTH", "960"))
+    MIN_VIEWPORT_HEIGHT: int = int(os.getenv("MIN_VIEWPORT_HEIGHT", "480"))
+    BROWSER_CHROME_HEIGHT: int = int(os.getenv("BROWSER_CHROME_HEIGHT", "148"))
+
+    @classmethod
+    def fit_viewport_to_display(cls, width: int, height: int) -> tuple[int, int]:
+        """Keep the browser viewport inside the visible headed display."""
+        bounded_width = width
+        bounded_height = height
+        if cls.DISPLAY_WIDTH is not None:
+            bounded_width = min(bounded_width, max(cls.MIN_VIEWPORT_WIDTH, cls.DISPLAY_WIDTH))
+        if cls.DISPLAY_HEIGHT is not None:
+            max_height = max(cls.MIN_VIEWPORT_HEIGHT, cls.DISPLAY_HEIGHT - cls.BROWSER_CHROME_HEIGHT)
+            bounded_height = min(bounded_height, max_height)
+        return bounded_width, bounded_height
 
     @classmethod
     def ensure_dirs(cls) -> None:

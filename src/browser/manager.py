@@ -202,9 +202,11 @@ class BrowserManager:
         log.info("Launching browser...")
         self._playwright = await async_playwright().start()
 
-        # Randomize viewport slightly to avoid fingerprint consistency
-        width = Config.VIEWPORT_WIDTH + random.randint(-20, 20)
-        height = Config.VIEWPORT_HEIGHT + random.randint(-20, 20)
+        # Randomize viewport slightly, then clamp so browser chrome fits in noVNC.
+        width, height = Config.fit_viewport_to_display(
+            Config.VIEWPORT_WIDTH + random.randint(-20, 20),
+            Config.VIEWPORT_HEIGHT + random.randint(-20, 20),
+        )
 
         # Try real Chrome first, fall back to bundled Chromium
         chrome_args = [
@@ -218,6 +220,12 @@ class BrowserManager:
             "--disable-features=AsyncDns,DnsOverHttps",
             "--dns-prefetch-disable",
         ]
+        if Config.DISPLAY_WIDTH is not None and Config.DISPLAY_HEIGHT is not None:
+            chrome_args.extend([
+                f"--window-size={Config.DISPLAY_WIDTH},{Config.DISPLAY_HEIGHT}",
+                "--window-position=0,0",
+            ])
+
 
         # Docker-specific flags
         if os.path.exists("/.dockerenv") or os.environ.get("DISPLAY") == ":99":
