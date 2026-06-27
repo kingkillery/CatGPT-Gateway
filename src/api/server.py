@@ -27,6 +27,7 @@ from src.claude.client import ClaudeClient
 from src.config import Config
 from src.api.routes import router, set_client
 from src.api.openai_routes import openai_router, set_openai_client
+from src.api.files_routes import files_router
 from src.log import setup_logging
 
 log = setup_logging("api_server")
@@ -175,6 +176,7 @@ app.add_middleware(
 
 app.include_router(router)
 app.include_router(openai_router)
+app.include_router(files_router)
 
 
 @app.get("/healthz", include_in_schema=False)

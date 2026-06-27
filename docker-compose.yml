@@ -54,6 +54,7 @@ services:
       - RESPONSE_TIMEOUT=2100000
       - SELECTOR_TIMEOUT=10000
       - LIVENESS_INTERVAL_MS=180000
+      - UPLOAD_TIMEOUT=180000
 
       # Human simulation
       - TYPING_SPEED_MIN=50

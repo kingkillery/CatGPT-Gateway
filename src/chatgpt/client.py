@@ -277,74 +277,65 @@ class ChatGPTClient:
     async def new_chat(self) -> None:
         """Start a new conversation.
 
+        Uses temporary chats (https://chatgpt.com/?temporary-chat=true) so new
+        conversations are NOT saved to the sidebar history.
+
         Strategy order:
-        1. SPA button click (avoids DNS issues, preserves browser state)
-        2. JavaScript location change (no DNS lookup needed if page is loaded)
-        3. Full page.goto() (last resort — may fail with DNS errors)
+        1. JavaScript location change to the temporary-chat URL (no DNS lookup)
+        2. Full page.goto() to the temporary-chat URL (last resort)
         """
-        # Already on a fresh chat — nothing to do
-        if "chatgpt.com" in self._page.url:
+        # Already on a fresh temporary chat — nothing to do. A normal empty
+        # "/" chat is NOT skipped, because we specifically want temporary chats
+        # so the conversation does not clutter the sidebar history.
+        if "chatgpt.com" in self._page.url and "temporary-chat=true" in self._page.url:
             try:
                 turn_count = await self._page.evaluate(
                     "document.querySelectorAll('[data-testid^=\"conversation-turn-\"]').length"
                 )
                 if turn_count == 0:
-                    log.info("Already on a fresh chat — skipping navigation")
+                    log.info("Already on a fresh temporary chat — skipping navigation")
                     return
             except Exception:
                 pass
 
-        # Strategy 1: SPA button click
-        for selector in Selectors.NEW_CHAT_BUTTON:
-            try:
-                btn = await self._page.query_selector(selector)
-                if btn and await btn.is_visible():
-                    await btn.click()
-                    log.info(f"New chat via SPA button: {selector}")
-                    await asyncio.sleep(1)
-                    # Verify we're on a fresh chat
-                    try:
-                        turn_count = await self._page.evaluate(
-                            "document.querySelectorAll('[data-testid^=\"conversation-turn-\"]').length"
-                        )
-                        if turn_count == 0:
-                            await self._wait_for_chat_input()
-                            return
-                    except Exception:
-                        pass
-            except Exception:
-                continue
-
-        # Strategy 2: JavaScript navigation (avoids DNS lookup)
+        # Strategy 1: Navigate to a temporary chat directly. Prefer this over
+        # the "New chat" SPA button, which would create a normal (saved) chat
+        # and clutter the sidebar history.
         try:
-            log.info("New chat via JS navigation...")
-            await self._page.evaluate("window.location.href = '/'")
+            log.info("New temporary chat via JS navigation...")
+            await self._page.evaluate("window.location.href = '/?temporary-chat=true'")
             await self._page.wait_for_load_state("domcontentloaded", timeout=15000)
+            await asyncio.sleep(1)
             page_error = await self._detect_page_error()
             if not page_error:
-                log.info("New chat started (JS navigation)")
-                await self._wait_for_chat_input()
-                return
+                try:
+                    turn_count = await self._page.evaluate(
+                        "document.querySelectorAll('[data-testid^=\"conversation-turn-\"]').length"
+                    )
+                    if turn_count == 0:
+                        await self._wait_for_chat_input()
+                        log.info("Temporary chat started")
+                        return
+                except Exception:
+                    pass
         except Exception as e:
-            log.warning(f"JS navigation failed: {e}")
+            log.warning(f"Temporary-chat JS navigation failed: {e}")
 
-        # Strategy 3: Full page.goto() — last resort
+        # Strategy 2: Full page.goto() fallback to the temporary-chat URL.
+        # The SPA "New chat" button is intentionally NOT used: it creates a
+        # normal (saved) chat that clutters the sidebar history.
+        temp_url = f"{Config.CHATGPT_URL.rstrip('/')}/?temporary-chat=true"
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
-            log.info(f"New chat via page.goto (attempt {attempt}/{max_attempts})...")
+            log.info(f"New temporary chat via page.goto (attempt {attempt}/{max_attempts})...")
             try:
-                await self._page.goto(
-                    Config.CHATGPT_URL,
-                    wait_until="domcontentloaded",
-                    timeout=30000,
-                )
+                await self._page.goto(temp_url, wait_until="domcontentloaded", timeout=30000)
             except Exception as e:
                 log.warning(f"page.goto failed (attempt {attempt}): {e}")
                 if attempt < max_attempts:
                     await asyncio.sleep(attempt * 3)
                     continue
                 raise
-
             page_error = await self._detect_page_error()
             if page_error:
                 log.error(f"Page error after goto (attempt {attempt}): {page_error}")
@@ -352,9 +343,8 @@ class ChatGPTClient:
                     await asyncio.sleep(attempt * 3)
                     continue
                 raise RuntimeError(f"Page error persists after {max_attempts} attempts: {page_error}")
-
-            log.info("New chat started (page.goto)")
             await self._wait_for_chat_input()
+            log.info("Temporary chat started via page.goto")
             return
 
     async def _wait_for_chat_input(self) -> None:
@@ -658,12 +648,60 @@ class ChatGPTClient:
                 log.error(f"Failed to upload files: {e}")
                 raise RuntimeError(f"Could not upload files: {e}")
 
-        # Wait for files to be processed/attached (thumbnails/badges appear)
-        await asyncio.sleep(3)
-        # Additional wait if multiple files
-        if len(valid_paths) > 1:
-            await asyncio.sleep(len(valid_paths))
+        # Wait for the upload to actually finish (uploads can take a while for
+        # large files). Poll the composer for an attachment chip and the absence
+        # of an in-progress indicator before returning.
+        await self._wait_for_upload_complete(len(valid_paths))
         log.info("File upload complete")
+
+    async def _wait_for_upload_complete(self, expected: int) -> None:
+        """Poll until attachment(s) finish uploading, bounded by UPLOAD_TIMEOUT."""
+        timeout_s = Config.UPLOAD_TIMEOUT / 1000
+        poll = 1.0
+        elapsed = 0.0
+        appeared = False
+        stable = 0
+        # Give the chip a moment to render before polling state.
+        await asyncio.sleep(1)
+        while elapsed < timeout_s:
+            try:
+                state = await self._page.evaluate(
+                    """() => {
+                        const inProgress = document.querySelectorAll(
+                            '[role="progressbar"], [aria-busy="true"], [data-testid*="uploading"], [class*="uploading"], [aria-label*="Uploading"]'
+                        ).length;
+                        const attachments = document.querySelectorAll(
+                            '[data-testid*="attachment"], [class*="attachment"], button[aria-label*="Remove file"], button[aria-label*="Remove attachment"]'
+                        ).length;
+                        return { inProgress, attachments };
+                    }"""
+                )
+            except Exception as e:
+                log.debug(f"Upload-state poll failed: {e}")
+                state = {"inProgress": 0, "attachments": 0}
+
+            if state.get("attachments", 0) >= max(expected, 1):
+                appeared = True
+            if appeared and state.get("inProgress", 0) == 0:
+                stable += 1
+                if stable >= 2:
+                    log.info(f"Upload finished after {int(elapsed)}s")
+                    return
+            else:
+                stable = 0
+
+            if elapsed > 0 and int(elapsed) % 10 == 0:
+                log.debug(
+                    f"[upload] {int(elapsed)}s — attachments={state.get('attachments')} "
+                    f"in_progress={state.get('inProgress')}"
+                )
+            await asyncio.sleep(poll)
+            elapsed += poll
+
+        log.warning(
+            f"Upload wait timed out after {int(elapsed)}s "
+            f"(attachment_seen={appeared}); sending anyway"
+        )
 
     def _extract_thread_id(self) -> str:
         """Extract the thread/conversation ID from the current URL."""

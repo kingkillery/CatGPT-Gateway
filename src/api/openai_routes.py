@@ -205,6 +205,16 @@ def _extract_file_attachments(content) -> list[dict]:
         file_info = item.get("file", {})
         if not isinstance(file_info, dict):
             continue
+        # Reference to a previously uploaded file (Files API): resolve id -> path.
+        file_id = file_info.get("file_id")
+        if file_id:
+            from src.api.files_routes import file_store
+            local_path = file_store.path_for(file_id)
+            if local_path:
+                files.append({"local_path": local_path})
+            else:
+                log.warning(f"Referenced file_id not found: {file_id}")
+            continue
         filename = file_info.get("filename", "attachment")
         # Two ways to supply file data:
         # 1. data + mime_type  2. url (data-URL)
@@ -238,6 +248,10 @@ async def _download_file(url_or_data: str | dict, download_dir: str = "/tmp/catg
 
     # ── Dict form (from _extract_file_attachments) ──
     if isinstance(url_or_data, dict):
+        # Pre-resolved local path (e.g. a Files API file_id reference).
+        local_path = url_or_data.get("local_path")
+        if local_path:
+            return local_path if os.path.isfile(local_path) else None
         try:
             filename = url_or_data.get("filename", "file")
             data_b64 = url_or_data["data_b64"]
@@ -507,6 +521,56 @@ def _forced_tool_name_from_choice(tool_choice: str | dict | None) -> str | None:
         return None
     name = function.get("name")
     return name if isinstance(name, str) and name else None
+
+
+_TOOL_REFUSAL_MARKERS = (
+    "fake tool call",
+    "fabricate a tool call",
+    "fabricate a json tool call",
+    "fabricated tool call",
+    "can't produce a fake",
+    "cannot produce a fake",
+    "can't call a bash",
+    "isn't actually available",
+    "is not actually available",
+    "isn't available in this chat",
+    "doesn't exist in this chat",
+    "does not actually exist",
+    "no such tool",
+)
+
+
+def _looks_like_tool_refusal(text: str | None) -> bool:
+    """True if the model meta-refused to emit a tool call (a "bad call")."""
+    if not text:
+        return False
+    low = text.lower()
+    return any(marker in low for marker in _TOOL_REFUSAL_MARKERS)
+
+
+def _build_bad_call_correction(forced_name: str | None, forced: bool) -> str:
+    """Correction nudge sent after a bad tool call (refusal or malformed JSON)."""
+    if forced:
+        skeleton = (
+            f'{{"tool_calls":[{{"name":"{forced_name}","arguments":{{}}}}]}}'
+            if forced_name
+            else '{"tool_calls":[{"name":"<an available name>","arguments":{}}]}'
+        )
+        return (
+            "Your previous response was not a valid JSON object. Ignore it and "
+            f"reply with ONLY the corrected raw JSON object, exactly this shape: {skeleton}. "
+            "Escape every double-quote inside string values, prefer single quotes "
+            "inside shell commands, and output no prose and no code fence."
+        )
+    return (
+        "The functions listed above are real tools provided by the caller, who "
+        "executes them and returns results — never say they are unavailable. If "
+        "one helps with the request, respond with ONLY a raw JSON object of this "
+        'shape: {"tool_calls":[{"name":"<function name>","arguments":{}}]} '
+        "(escape double-quotes inside strings, single quotes in shell commands, "
+        "no code fence). If none are needed, answer the request directly in plain "
+        "prose with no remarks about tools or availability."
+    )
 
 
 def _build_tool_protocol_suffix(tool_choice: str | dict | None = None) -> str:
@@ -1064,28 +1128,21 @@ async def _run_completion(request: ChatCompletionRequest) -> ChatCompletionRespo
                 # When the model calls tools, content should be null
                 response_text = None
 
-        # ── Forced-tool retry (bounded to one correction turn) ──────────
-        # A forced/required tool call that failed to parse (refusal, malformed
-        # JSON, or embedded unescaped quotes) gets a single short correction in
-        # the same thread. Parse only the retry text; never after a tool result.
+        # ── Bad-call retry (bounded to one correction turn) ──────────────
+        # Default handling when a tool call is needed but the model made a
+        # "bad call": a forced/required parse miss, or an auto-mode meta-refusal
+        # ("I can't fabricate a tool call ..."). One correction turn in the same
+        # thread; parse only the retry text; never after a tool-result turn.
+        bad_call = force_tool_protocol or _looks_like_tool_refusal(response_text)
         if (
             not tool_calls
-            and force_tool_protocol
+            and has_tool_prompt
+            and request.tools
+            and bad_call
             and not any(msg.role == "tool" for msg in request.messages)
         ):
             forced_name = _forced_tool_name_from_choice(request.tool_choice)
-            skeleton = (
-                f'{{"tool_calls":[{{"name":"{forced_name}","arguments":{{}}}}]}}'
-                if forced_name
-                else '{"tool_calls":[{"name":"<an available name>","arguments":{}}]}'
-            )
-            correction = (
-                "Your previous response was not a valid JSON object. Ignore it "
-                "and reply with ONLY the corrected raw JSON object, exactly this "
-                f"shape: {skeleton}. Escape every double-quote inside string "
-                "values, prefer single quotes inside shell commands, and output "
-                "no prose and no code fence."
-            )
+            correction = _build_bad_call_correction(forced_name, force_tool_protocol)
             try:
                 retry_result = await client.send_message(correction)
                 retry_text = retry_result.message if retry_result else None
@@ -1095,10 +1152,14 @@ async def _run_completion(request: ChatCompletionRequest) -> ChatCompletionRespo
                         tool_calls = retry_calls
                         finish_reason = "tool_calls"
                         response_text = None
-                        elapsed_ms = int((time.time() - start_time) * 1000)
-                        log.info("Forced tool-call retry succeeded after parse miss")
+                        log.info("Bad-call retry produced a tool call")
+                    elif not force_tool_protocol and not _looks_like_tool_refusal(retry_text):
+                        # Auto mode: keep the clean answer, drop the refusal.
+                        response_text = retry_text
+                        log.info("Bad-call retry produced a direct answer")
+                    elapsed_ms = int((time.time() - start_time) * 1000)
             except Exception as e:
-                log.warning(f"Forced tool-call retry send failed: {e}")
+                log.warning(f"Bad-call retry send failed: {e}")
 
         # ── Build response ──────────────────────────────────
         prompt_tokens = _estimate_tokens(prompt)
