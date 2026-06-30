@@ -21,6 +21,11 @@ dist/
 *.egg-info/
 *.egg
 
+# ── Test / tooling caches ──
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
 # ── Virtual Environment ──
 .venv/
 venv/

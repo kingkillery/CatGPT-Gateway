@@ -98,6 +98,21 @@ class Config:
     # minutes to respond — verifies generation is still progressing (ms).
     LIVENESS_INTERVAL_MS: int = int(os.getenv("LIVENESS_INTERVAL_MS", "180000"))
 
+    # ── Submission detection (post-paste) ───────────────────────────────
+    # After pasting text, ChatGPT's current frontend often auto-submits. We
+    # probe for that with a single combined-signal DOM read at this cadence,
+    # and click the send button ourselves if no submission is seen by the
+    # timeout. Old behaviour was a fixed 6×500ms (3s) poll that wasted up to
+    # 3s on every request the frontend did NOT auto-submit.
+    SUBMIT_PROBE_INTERVAL_MS: int = int(os.getenv("SUBMIT_PROBE_INTERVAL_MS", "100"))
+    SUBMIT_PROBE_TIMEOUT_MS: int = int(os.getenv("SUBMIT_PROBE_TIMEOUT_MS", "1500"))
+    # Settle pause after the completion signal before extracting (ms). The copy
+    # button already means generation finished, so this only guards DOM finalize.
+    POST_COMPLETION_SETTLE_MS: int = int(os.getenv("POST_COMPLETION_SETTLE_MS", "50"))
+    # Clipboard read-back after clicking copy: poll instead of a fixed 300ms wait.
+    CLIPBOARD_POLL_INTERVAL_MS: int = int(os.getenv("CLIPBOARD_POLL_INTERVAL_MS", "50"))
+    CLIPBOARD_POLL_TIMEOUT_MS: int = int(os.getenv("CLIPBOARD_POLL_TIMEOUT_MS", "600"))
+
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "DEBUG")
     VERBOSE: bool = os.getenv("VERBOSE", "true").lower() == "true"

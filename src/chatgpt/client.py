@@ -160,16 +160,23 @@ class ChatGPTClient:
         # 3. Paste the message (all at once)
         await human_type(self._page, input_selector, text)
 
-        # 4. Poll briefly for auto-submit (execCommand can trigger
-        #    f/conversation automatically in the current frontend).
-        #    If a new assistant turn appeared, skip the send button click.
+        # 4. Detect submission. ChatGPT's current frontend usually auto-submits
+        #    on text insertion (execCommand fires the f/conversation request).
+        #    Probe fast, definitive signals — a new assistant turn or a visible
+        #    stop button — at a fine cadence, and click the send button ourselves
+        #    only if nothing submitted within SUBMIT_PROBE_TIMEOUT_MS. The old
+        #    code blindly slept 6×500ms (up to 3s) on every request the frontend
+        #    did NOT auto-submit, delaying the actual send by that whole window.
         auto_submitted = False
-        for _ in range(6):  # poll up to ~3s in 0.5s intervals
-            await asyncio.sleep(0.5)
-            post_count = await count_assistant_messages(self._page)
-            if post_count > pre_count:
+        interval = Config.SUBMIT_PROBE_INTERVAL_MS / 1000
+        deadline = Config.SUBMIT_PROBE_TIMEOUT_MS / 1000
+        waited = 0.0
+        while waited < deadline:
+            if await self._submission_detected(pre_count):
                 auto_submitted = True
                 break
+            await asyncio.sleep(interval)
+            waited += interval
 
         if auto_submitted:
             log.info("ChatGPT auto-submitted after text entry — skipping send button click")
@@ -193,13 +200,17 @@ class ChatGPTClient:
         if not completed:
             log.warning("Response may not be complete (timeout)")
 
-        # Small buffer after completion to let DOM settle
-        await asyncio.sleep(0.2)
+        # Small buffer after the completion signal to let the DOM finalize.
+        # The copy button already means generation finished, so keep it short.
+        await asyncio.sleep(Config.POST_COMPLETION_SETTLE_MS / 1000)
 
-        # 6. Check for generated images in the response FIRST
-        #    (image turns have no copy button, so we must detect images
-        #    before trying copy-button extraction)
-        images = await extract_images_from_response(self._page)
+        # 6. Check for generated images. A "copy" completion is necessarily a
+        #    text turn (image turns expose no copy button), so skip the image
+        #    DOM scan in that common case; scan only on image/fallback paths.
+        if completed == "copy":
+            images = []
+        else:
+            images = await extract_images_from_response(self._page)
         has_images = len(images) > 0
 
         # 7. Extract text content
@@ -271,6 +282,41 @@ class ChatGPTClient:
             images=images,
             has_images=has_images,
         )
+
+    async def _submission_detected(self, pre_assistant_count: int) -> bool:
+        """Fast, single-DOM-read check that the message was actually submitted.
+
+        Combines definitive submission signals so the post-paste wait can end the
+        instant ChatGPT accepts the message: a new assistant turn appeared, or a
+        stop-generating button is visible (streaming started). Only positive
+        evidence triggers, so it never falsely concludes a non-submitted message
+        was sent (which would skip the send-button fallback and hang).
+        """
+        try:
+            state = await self._page.evaluate(
+                """
+                (prevAssistant) => {
+                    const turns = Array.from(document.querySelectorAll('section[data-testid^="conversation-turn-"]'));
+                    let assistant = 0;
+                    for (const t of turns) {
+                        const role = t.getAttribute('data-turn');
+                        if (role === 'assistant' || t.querySelector('[data-message-author-role="assistant"]')) assistant++;
+                    }
+                    const composer = document.querySelector('#prompt-textarea, div[contenteditable="true"]');
+                    const inputEmpty = !composer || (composer.innerText || composer.textContent || '').trim().length === 0;
+                    const stopEl = document.querySelector('button[aria-label="Stop streaming"], button[aria-label="Stop generating"], button[aria-label="Stop answering"], button[data-testid="stop-button"]');
+                    const stopVisible = !!stopEl && stopEl.getBoundingClientRect().width > 0;
+                    return { newAssistant: assistant > prevAssistant, stopVisible, inputEmpty, submitProbe: true };
+                }
+                """,
+                pre_assistant_count,
+            )
+        except Exception as e:
+            log.debug(f"Submission probe failed: {e}")
+            return False
+        if not isinstance(state, dict):
+            return False
+        return bool(state.get("newAssistant") or state.get("stopVisible"))
 
     # ── Navigation ──────────────────────────────────────────────
 

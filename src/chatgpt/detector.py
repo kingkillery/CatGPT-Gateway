@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import weakref
 
 from patchright.async_api import Page
 from patchright._impl._errors import TargetClosedError
@@ -20,6 +21,23 @@ from src.log import setup_logging
 from src.config import Config
 
 log = setup_logging("detector")
+
+# Track browser contexts that already have clipboard permission so we grant it
+# once per session instead of on every extraction (a CDP round-trip each time).
+_clipboard_granted: "weakref.WeakSet" = weakref.WeakSet()
+
+
+async def _ensure_clipboard_permissions(page: Page) -> None:
+    """Grant clipboard read/write once per browser context (idempotent + cheap)."""
+    try:
+        context = page.context
+    except Exception:
+        context = None
+    if context is not None and context in _clipboard_granted:
+        return
+    await page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+    if context is not None:
+        _clipboard_granted.add(context)
 
 
 def normalize_assistant_text(text: str | None) -> str:
@@ -99,16 +117,21 @@ async def _dump_all_turns(page: Page) -> list[dict]:
         return []
 
 
-async def _latest_assistant_turn_snapshot(page: Page) -> dict:
+async def _latest_assistant_turn_snapshot(page: Page, need_text: bool = True) -> dict:
     """
     Return metadata for the latest assistant turn (article ordered).
 
     signature format: "<article-index>:<stable-id>"
     where stable-id is best-effort from DOM attributes.
+
+    ``need_text=False`` skips the ``innerText`` read. ``innerText`` forces a
+    layout/reflow and grows with the response, so the high-frequency completion
+    poll passes ``False`` — it only needs the signature + copy/image flags.
+    Diagnostics and stability checks pass ``True`` when they actually use text.
     """
     snapshot = await page.evaluate(
         """
-        () => {
+        (needText) => {
             const turns = Array.from(document.querySelectorAll('section[data-testid^="conversation-turn-"]'));
 
             for (let idx = turns.length - 1; idx >= 0; idx--) {
@@ -132,7 +155,7 @@ async def _latest_assistant_turn_snapshot(page: Page) -> dict:
                     turn.querySelector('img[alt="Generated image"], div[id^="image-"] img, div[id^="image-"]')
                 );
 
-                const text = (turn.innerText || '').trim();
+                const text = needText ? (turn.innerText || '').trim() : '';
 
                 return {
                     found: true,
@@ -153,7 +176,8 @@ async def _latest_assistant_turn_snapshot(page: Page) -> dict:
                 text: '',
             };
         }
-        """
+        """,
+        need_text,
     )
 
     if not isinstance(snapshot, dict):
@@ -166,7 +190,7 @@ async def _latest_assistant_turn_snapshot(page: Page) -> dict:
 
 async def get_latest_assistant_turn_signature(page: Page) -> str | None:
     """Return signature for the latest assistant turn, if available."""
-    snapshot = await _latest_assistant_turn_snapshot(page)
+    snapshot = await _latest_assistant_turn_snapshot(page, need_text=False)
     signature = snapshot.get("signature")
     return signature if isinstance(signature, str) and signature else None
 
@@ -194,7 +218,7 @@ async def count_assistant_messages(page: Page) -> int:
 
 async def _detect_image_in_latest_turn(page: Page, previous_turn_signature: str | None = None) -> bool:
     """Check if the newest assistant turn (not previous turn) contains an image."""
-    snapshot = await _latest_assistant_turn_snapshot(page)
+    snapshot = await _latest_assistant_turn_snapshot(page, need_text=False)
     signature = snapshot.get("signature")
     is_new_turn = previous_turn_signature is None or (
         isinstance(signature, str) and signature != previous_turn_signature
@@ -238,7 +262,7 @@ async def _wait_for_new_turn_signature(
     heartbeat = 10
 
     while elapsed * 1000 < timeout_ms:
-        snapshot = await _latest_assistant_turn_snapshot(page)
+        snapshot = await _latest_assistant_turn_snapshot(page, need_text=False)
         signature = snapshot.get("signature")
         if isinstance(signature, str) and signature and signature != previous_turn_signature:
             log.debug(f"New assistant turn detected: {signature} (prev: {previous_turn_signature})")
@@ -259,7 +283,7 @@ async def wait_for_response_complete(
     expected_msg_count: int | None = None,
     timeout_ms: int | None = None,
     previous_turn_signature: str | None = None,
-) -> bool:
+) -> str:
     """
     Wait until ChatGPT finishes generating the current response.
 
@@ -289,25 +313,25 @@ async def wait_for_response_complete(
     completed = await _wait_for_copy_button_or_image(page, timeout, previous_turn_signature)
     if completed == "copy":
         log.info("Response complete — copy button appeared on latest turn")
-        return True
+        return "copy"
     if completed == "image":
         log.info("Response complete — generated image detected on latest turn")
-        return True
+        return "image"
 
     log.info("Copy/image completion not detected, trying stop-button strategy...")
     try:
         result = await _wait_via_stop_button(page, timeout)
         if result:
-            return True
+            return "stream"
     except Exception as e:
         log.debug(f"Stop button strategy failed: {e}")
 
     log.info("Falling back to text-stability detection...")
     try:
-        return await _wait_via_text_stability(page, timeout, previous_turn_signature)
+        return "stable" if await _wait_via_text_stability(page, timeout, previous_turn_signature) else ""
     except Exception as e:
         log.error(f"All strategies failed: {e}")
-        return False
+        return ""
 
 
 async def _check_page_error(page: Page) -> str | None:
@@ -376,7 +400,7 @@ async def _wait_for_copy_button_or_image(
 
     while elapsed * 1000 < timeout_ms:
         try:
-            snapshot = await _latest_assistant_turn_snapshot(page)
+            snapshot = await _latest_assistant_turn_snapshot(page, need_text=False)
         except TargetClosedError:
             log.error("Page/browser closed while waiting for response")
             return None
@@ -394,7 +418,8 @@ async def _wait_for_copy_button_or_image(
         # Log the first snapshot for diagnostics
         if not first_snapshot_logged and elapsed >= 2:
             first_snapshot_logged = True
-            turn_text = (snapshot.get("text") or "")[:200]
+            text_snapshot = await _latest_assistant_turn_snapshot(page, need_text=True)
+            turn_text = (text_snapshot.get("text") or "")[:200]
             all_turns = await _dump_all_turns(page)
             log.debug(
                 f"First snapshot at {int(elapsed)}s | "
@@ -419,7 +444,8 @@ async def _wait_for_copy_button_or_image(
         if elapsed >= next_heartbeat:
             next_heartbeat = elapsed + heartbeat
             # Diagnostic: log what we see on the latest assistant turn
-            turn_text = (snapshot.get("text") or "")[:200]
+            text_snapshot = await _latest_assistant_turn_snapshot(page, need_text=True)
+            turn_text = (text_snapshot.get("text") or "")[:200]
             log.debug(
                 f"Still waiting for copy/image... ({int(elapsed)}s) | "
                 f"sig={signature} is_new={is_new_turn} "
@@ -444,7 +470,8 @@ async def _wait_for_copy_button_or_image(
         # generation is still progressing so a silent stall surfaces here.
         if elapsed >= next_liveness:
             next_liveness = elapsed + liveness_interval
-            cur_len = len(snapshot.get("text") or "")
+            text_snapshot = await _latest_assistant_turn_snapshot(page, need_text=True)
+            cur_len = len(text_snapshot.get("text") or "")
             grew = cur_len - liveness_last_len
             liveness_last_len = cur_len
             stop_visible = await _stop_button_visible(page)
@@ -565,7 +592,7 @@ async def extract_last_response_via_copy(
     log.debug("Attempting extraction via latest-turn copy button...")
 
     try:
-        await page.context.grant_permissions(["clipboard-read", "clipboard-write"])
+        await _ensure_clipboard_permissions(page)
 
         if previous_turn_signature:
             await _wait_for_new_turn_signature(page, previous_turn_signature, timeout_ms=8000)
@@ -614,9 +641,20 @@ async def extract_last_response_via_copy(
         )
 
         if isinstance(click_result, dict) and click_result.get("clicked"):
-            await asyncio.sleep(0.3)
-            content = await page.evaluate("navigator.clipboard.readText().catch(() => '')")
-            if content and content.strip() and content.strip() != str(pre_clipboard).strip():
+            # Poll the clipboard instead of a fixed 300ms wait — return as soon
+            # as the copied text lands (usually well under 100ms).
+            pre = str(pre_clipboard).strip()
+            interval = Config.CLIPBOARD_POLL_INTERVAL_MS / 1000
+            deadline = Config.CLIPBOARD_POLL_TIMEOUT_MS / 1000
+            waited = 0.0
+            content = ""
+            while waited < deadline:
+                await asyncio.sleep(interval)
+                waited += interval
+                content = await page.evaluate("navigator.clipboard.readText().catch(() => '')")
+                if content and content.strip() and content.strip() != pre:
+                    break
+            if content and content.strip() and content.strip() != pre:
                 log.info(
                     "Extracted via copy button (latest-turn): "
                     f"{len(content)} chars, turn={click_result.get('signature')}"
