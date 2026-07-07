@@ -45,6 +45,7 @@ from src.api.openai_schemas import (
     UsageInfo,
 )
 from src.chatgpt.client import ChatGPTClient
+from src.chatgpt.model_selector import select_model_option
 from src.claude.client import ClaudeClient
 from src.config import Config
 from src.log import setup_logging
@@ -1093,6 +1094,26 @@ async def _run_completion(request: ChatCompletionRequest) -> ChatCompletionRespo
 
         # Start a fresh conversation to avoid thread exhaustion
         await _ensure_fresh_chat()
+
+        # ── Switch model intensity if requested ─────────────
+        if request.intensity:
+            intensity = request.intensity.strip().lower()
+            log.info(f"Requested intensity: {intensity}")
+            if isinstance(client, ChatGPTClient):
+                selection = await select_model_option(
+                    client.page, intensity=intensity
+                )
+                if selection.matched and selection.selected:
+                    log.info(f"Model switched to: {selection.selected}")
+                else:
+                    log.warning(
+                        f"No model option matched intensity '{intensity}': {selection.reason}"
+                    )
+                    # Fallback: prepend intensity hint to the prompt
+                    prompt = (
+                        f"[Requested reasoning intensity: {intensity}. "
+                        f"Use the closest available mode for this answer.]\n\n{prompt}"
+                    )
 
         # ── Send to provider ────────────────────────────────
         try:

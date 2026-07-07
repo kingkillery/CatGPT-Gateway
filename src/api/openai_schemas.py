@@ -89,7 +89,9 @@ class ChatCompletionRequest(BaseModel):
     stream_options: Optional[StreamOptions] = None
     n: Optional[int] = 1
     user: Optional[str] = None
-
+    # CatGPT-specific: switch the browser model picker before sending.
+    # Accepts "fast", "normal", "deep", "pro", or "thinking".
+    intensity: Optional[str] = None
 
 # ── Response ────────────────────────────────────────────────────
 
