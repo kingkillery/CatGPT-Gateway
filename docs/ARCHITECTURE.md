@@ -169,7 +169,7 @@ The web UIs don't have native tool-calling APIs. CatGPT implements tool calling 
 
 ### Multi-Turn Tool Calls
 
-When tool results come back as `ToolMessage`s, the gateway builds a prompt transcript showing what was called and what was returned. The model sees the results and produces a natural language summary. The prompt explicitly says "Do NOT call tools again for the same request" to prevent loops.
+When tool results come back as `ToolMessage`s, the gateway builds a prompt transcript showing what was called and what was returned. Each result names its tool and call id. The model either answers or, if more work is needed, calls another tool, so multi-step agent loops work; it is told never to repeat a call that already returned its result. In `auto` mode the final protocol reminder is appended on every turn; forced/required modes append it before the first tool result, then tell the model to answer.
 
 ---
 

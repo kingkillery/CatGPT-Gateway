@@ -357,7 +357,11 @@ def _build_prompt(messages: list[ChatMessage]) -> str:
     if len(non_system) == 1 and non_system[0].role == "user":
         prefix = ""
         if system_msgs:
-            sys_text = _extract_content_text(system_msgs[0].content)
+            # Keep every system message: the injected tool block is first, and
+            # the caller's own system prompt (e.g. an agent's) must survive too.
+            sys_text = "\n\n".join(
+                t for t in (_extract_content_text(m.content) for m in system_msgs) if t
+            )
             if Config.PROVIDER == "claude":
                 # Claude rejects "[System instruction: ...]" as prompt injection.
                 # Present it as context instead.
@@ -369,6 +373,12 @@ def _build_prompt(messages: list[ChatMessage]) -> str:
 
     # Multi-turn: build a transcript
     parts: list[str] = []
+    call_names = {
+        tc.id: tc.function.name
+        for m in messages
+        if m.role == "assistant" and m.tool_calls
+        for tc in m.tool_calls
+    }
     for msg in messages:
         role = msg.role.capitalize()
         if msg.role == "system":
@@ -383,25 +393,26 @@ def _build_prompt(messages: list[ChatMessage]) -> str:
                     parts.append(f"System: {text}")
         elif msg.role == "tool":
             # Tool result — include both the call context and the result
+            # No "don't call tools again" here: agent loops need follow-up calls.
+            # The final protocol reminder says when to call more vs. answer.
             tool_content = _extract_content_text(msg.content)
+            tool_name = call_names.get(msg.tool_call_id, "tool")
             if Config.PROVIDER == "claude":
                 parts.append(
-                    f"The tool was executed and returned this result:\n{tool_content}\n\n"
-                    f"Now use the result above to answer the user's original question in plain text."
+                    f"The {tool_name} tool was executed and returned this result:\n{tool_content}"
                 )
             else:
                 parts.append(
-                    f"[Tool result for {msg.tool_call_id or 'unknown'}]: {tool_content}\n\n"
-                    f"Use the tool result to answer the user. Do NOT call tools again."
+                    f"[Tool result for {tool_name} ({msg.tool_call_id or 'unknown'})]: {tool_content}"
                 )
         elif msg.role == "assistant" and msg.tool_calls:
-            # Assistant requested tool calls — show what was called
-            calls_desc = []
-            for tc in msg.tool_calls:
-                calls_desc.append(
-                    f'{tc.function.name}({tc.function.arguments})'
-                )
-            parts.append(f"Assistant called tools: {', '.join(calls_desc)}")
+            # Assistant requested tool calls — keep any text it sent with them
+            calls_desc = ", ".join(
+                f"{tc.function.name}({tc.function.arguments}) [{tc.id}]"
+                for tc in msg.tool_calls
+            )
+            text = _extract_content_text(msg.content)
+            parts.append((f"{role}: {text}\n" if text else "") + f"Assistant called tools: {calls_desc}")
         elif msg.content:
             text = _extract_content_text(msg.content)
             if text:
@@ -482,7 +493,7 @@ Rules:
 1. Output ONLY the JSON code block when calling tools. Do not add any commentary, explanation, or text outside the code block.
 2. You may call multiple functions in one response by adding them to the array.
 3. Use the exact parameter names and types shown in each function's schema.
-4. When you receive tool results in a follow-up message, use them to give the user a natural, helpful answer. Do NOT output another JSON tool call for the same request.
+4. When you receive tool results in a follow-up message, use them. Call another function only if more work is needed, and never repeat a call that already returned its result; otherwise give the user a natural, helpful answer.
 
 Available functions:
 {tools_json}
@@ -510,7 +521,7 @@ Rules:
 1. Output ONLY the JSON code block when calling tools. No explanation, no text before or after.
 2. You may call multiple functions in one response by adding them to the array.
 3. Use the exact parameter names and types from each function's schema.
-4. When a follow-up message contains tool results, summarize them naturally for the user. Do NOT call tools again for the same request.
+4. When a follow-up message contains tool results, use them. Call another function only if more work is needed, and never repeat a call that already returned its result; otherwise summarize them naturally for the user.
 5. Do not use native ChatGPT browsing, search, connectors, uploads, or code interpreter for toolable work — use this JSON tool-call protocol.
 6. Do not refuse or say tools are unavailable — they are available through this interface.
 
@@ -611,10 +622,25 @@ Escape every double-quote that appears inside a string value, prefer single quot
 Derive the answer solely from the request above; do not use built-in web search or other assistants."""
 
     return """FINAL TOOL-CALL PROTOCOL REMINDER:
-The available functions above are the caller's external CLI tools.
-If any function is relevant to the user's last request, output ONLY a JSON tool-call code block.
-Use plain text only when no function is relevant.
+The available functions above are real tools the caller executes for you; their results come back in a follow-up message.
+If a function is needed for the user's last request and has not already returned that result, output ONLY a JSON tool-call code block.
+Otherwise answer in plain text.
 Do not use native ChatGPT browsing/search/tools instead of these functions."""
+
+
+def _append_tool_protocol_suffix(
+    prompt: str, messages: list[ChatMessage], tool_choice: str | dict | None
+) -> str:
+    """Append the final tool-call reminder to a tool-enabled prompt.
+
+    Auto mode gets the reminder every turn, so agents can keep calling tools.
+    Forced/required modes get it before the first tool result; afterwards they
+    are told to answer, since their system block still says "MUST call".
+    """
+    forced = _forced_tool_name_from_choice(tool_choice) is not None or tool_choice == "required"
+    if forced and any(msg.role == "tool" for msg in messages):
+        return f"{prompt}\n\nUse the tool results above to answer the user in plain text. Do NOT call tools again."
+    return f"{prompt}\n\n{_build_tool_protocol_suffix(tool_choice)}"
 
 
 _VALID_JSON_ESCAPE = frozenset('"\\/' + "bfnrtu")
@@ -1059,12 +1085,8 @@ async def _run_completion(request: ChatCompletionRequest) -> ChatCompletionRespo
             _forced_tool_name_from_choice(request.tool_choice) is not None
             or request.tool_choice == "required"
         )
-        if (
-            has_tool_prompt
-            and force_tool_protocol
-            and not any(msg.role == "tool" for msg in messages)
-        ):
-            prompt = f"{prompt}\n\n{_build_tool_protocol_suffix(request.tool_choice)}"
+        if has_tool_prompt:
+            prompt = _append_tool_protocol_suffix(prompt, messages, request.tool_choice)
         log.info(
             f"POST /v1/chat/completions — model={request.model}, "
             f"{len(request.messages)} messages, prompt={len(prompt)} chars"
@@ -1627,12 +1649,8 @@ async def create_response(request: ResponsesRequest):
             _forced_tool_name_from_choice(request.tool_choice) is not None
             or request.tool_choice == "required"
         )
-        if (
-            has_tool_prompt
-            and force_tool_protocol
-            and not any(msg.role == "tool" for msg in messages)
-        ):
-            prompt = f"{prompt}\n\n{_build_tool_protocol_suffix(request.tool_choice)}"
+        if has_tool_prompt:
+            prompt = _append_tool_protocol_suffix(prompt, messages, request.tool_choice)
         log.info(
             f"POST /v1/responses — model={request.model}, "
             f"input_type={'string' if isinstance(request.input, str) else 'array'}, "
