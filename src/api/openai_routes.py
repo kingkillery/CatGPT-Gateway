@@ -22,6 +22,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
+from src.api import formatter
 from src.api.openai_schemas import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -665,6 +666,24 @@ Choose shape 2 ONLY for requests you can answer entirely from your own knowledge
 - Tool results from the caller appear above. If a result already answers the request, reply with shape 2. If more work is needed, reply with shape 1, never repeating a call that already returned its result."""
 
 
+async def _repair_with_formatter(
+    response_text: str | None, tools: list[ToolDefinition]
+) -> list[ToolCall] | None:
+    """Last resort for a reply that tried to be a tool call but did not parse.
+
+    Only fires when the reply mentions "tool_calls" (a broken attempt, not prose) and an
+    OpenRouter key is configured. The repaired JSON still goes through _parse_tool_calls,
+    so tool names are validated against the request's tools.
+    """
+    if not response_text or "tool_calls" not in response_text or not formatter.enabled():
+        return None
+    fixed = await formatter.repair_tool_call(response_text, tools)
+    calls = _parse_tool_calls(fixed, tools) if fixed else None
+    if calls:
+        log.info("Formatter repaired a broken tool call")
+    return calls
+
+
 def _unwrap_answer(text: str | None) -> str | None:
     """Return the string from an auto-mode ``{"answer": "..."}`` reply, else None."""
     if not text or "answer" not in text:
@@ -1230,6 +1249,8 @@ async def _run_completion(request: ChatCompletionRequest) -> ChatCompletionRespo
 
         if has_tool_prompt and request.tools:
             tool_calls = _parse_tool_calls(response_text, request.tools)
+            if not tool_calls:
+                tool_calls = await _repair_with_formatter(response_text, request.tools)
             if tool_calls:
                 finish_reason = "tool_calls"
                 # When the model calls tools, content should be null
@@ -1809,6 +1830,8 @@ async def create_response(request: ResponsesRequest):
         tool_calls = None
         if has_tool_prompt and chat_tools:
             tool_calls = _parse_tool_calls(response_text, chat_tools)
+            if not tool_calls:
+                tool_calls = await _repair_with_formatter(response_text, chat_tools)
             if tool_calls:
                 response_text = None
             else:

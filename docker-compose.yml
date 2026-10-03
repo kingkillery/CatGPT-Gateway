@@ -62,6 +62,17 @@ services:
       - THINKING_PAUSE_MIN=1000
       - THINKING_PAUSE_MAX=3000
 
+      # Optional: a small OpenRouter model repairs a broken tool-call reply instead of
+      # spending another slow ChatGPT round trip. Off unless OPENROUTER_API_KEY is set in
+      # your shell or a git-ignored .env next to this file. Only the broken reply and the
+      # tool schemas are sent; free-tier models may log prompts.
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - CATGPT_FORMATTER_MODEL=${CATGPT_FORMATTER_MODEL:-openrouter/free}
+
+      # One fresh temporary chat per request (isolation). Raise to share a chat across
+      # that many requests: faster, but earlier requests leak into later ones.
+      - CATGPT_THREAD_MESSAGES=${CATGPT_THREAD_MESSAGES:-1}
+
       # API
       - API_HOST=0.0.0.0
       - API_PORT=8000
