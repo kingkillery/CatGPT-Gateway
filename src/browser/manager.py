@@ -7,16 +7,20 @@ Session data (cookies, localStorage, IndexedDB) survives restarts.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import random
 import signal
 import socket
+import time
 from pathlib import Path
 from patchright.async_api import async_playwright, BrowserContext, Page, Playwright
 
 from src.config import Config
 from src.browser.stealth import apply_stealth
 from src.log import setup_logging
+
+_LOGIN_CHECK_SECONDS = 60  # max wait for the page to show a composer or login button
 
 log = setup_logging("browser")
 
@@ -452,6 +456,17 @@ class BrowserManager:
         log.error("Page recovery failed after all attempts")
         return False
 
+    async def _any_visible(self, selectors: list[str]) -> bool:
+        """True if any selector currently matches a visible element (no waiting)."""
+        for selector in selectors:
+            try:
+                el = await self.page.query_selector(selector)
+                if el and await el.is_visible():
+                    return True
+            except Exception:
+                continue  # mid-navigation: the next poll retries
+        return False
+
     async def is_logged_in(self) -> bool:
         """
         Check if user is logged in by looking for chat input vs login indicators.
@@ -471,35 +486,23 @@ class BrowserManager:
             logged_in_indicators = []
 
         try:
-            # Try to find the chat input
-            for selector in chat_inputs:
-                try:
-                    el = await self.page.wait_for_selector(selector, timeout=3000)
-                    if el:
-                        log.info("Login check: LOGGED IN (chat input found)")
-                        return True
-                except Exception:
-                    continue
-
-            # Claude: also check for user-menu-button as a logged-in signal
-            for selector in logged_in_indicators:
-                try:
-                    el = await self.page.wait_for_selector(selector, timeout=2000)
-                    if el:
-                        log.info("Login check: LOGGED IN (user menu found)")
-                        return True
-                except Exception:
-                    continue
-
-            # Check for login indicators
-            for selector in login_indicators:
-                try:
-                    el = await self.page.wait_for_selector(selector, timeout=2000)
-                    if el:
-                        log.warning("Login check: NOT LOGGED IN (login button found)")
-                        return False
-                except Exception:
-                    continue
+            # ChatGPT reloads itself after load and can take 30+ s to render the
+            # composer, so poll for the first match instead of waiting a few
+            # seconds per selector and declaring the session signed out.
+            deadline = time.monotonic() + _LOGIN_CHECK_SECONDS
+            while True:
+                if await self._any_visible(list(chat_inputs)):
+                    log.info("Login check: LOGGED IN (chat input found)")
+                    return True
+                if await self._any_visible(list(logged_in_indicators)):
+                    log.info("Login check: LOGGED IN (user menu found)")
+                    return True
+                if await self._any_visible(list(login_indicators)):
+                    log.warning("Login check: NOT LOGGED IN (login button found)")
+                    return False
+                if time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(1)
 
             log.warning("Login check: UNCERTAIN — no chat input or login button found")
             return False

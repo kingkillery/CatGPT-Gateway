@@ -8,12 +8,16 @@ first-time login when no existing session is found, instead of crashing.
 from __future__ import annotations
 
 import asyncio
+import sys
+import time
 
 from src.browser.manager import BrowserManager
 from src.config import Config
 from src.log import setup_logging
 
 log = setup_logging("auto_login")
+
+_LOGIN_WAIT_SECONDS = 15 * 60  # non-interactive sign-in window before giving up
 
 
 async def ensure_logged_in(browser: BrowserManager) -> bool:
@@ -49,9 +53,22 @@ async def ensure_logged_in(browser: BrowserManager) -> bool:
     print("\n" + "=" * 60 + "\n")
 
     # Wait for user to sign in
-    await asyncio.get_event_loop().run_in_executor(
-        None, lambda: input("  Press ENTER after you've signed in successfully > ")
-    )
+    if sys.stdin.isatty():
+        await asyncio.get_event_loop().run_in_executor(
+            None, lambda: input("  Press ENTER after you've signed in successfully > ")
+        )
+    else:
+        # Docker/supervisor: there is no terminal, so input() would block startup
+        # forever and the API would never listen. Poll the page instead; the user
+        # signs in through noVNC (port 6080) and the server continues by itself.
+        print("  No terminal attached: waiting for sign-in in the browser window...\n", flush=True)
+        deadline = time.monotonic() + _LOGIN_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            if await browser.is_logged_in():
+                print("\n  ✅ Login verified! Session saved.\n", flush=True)
+                log.info("Non-interactive login completed successfully")
+                return True
+            await asyncio.sleep(10)
 
     # Give the page a moment to settle
     await asyncio.sleep(2)

@@ -119,6 +119,9 @@ class FakeElement:
     async def hover(self) -> None:
         self._page.clock.advance(HOVER)
 
+    async def is_visible(self) -> bool:
+        return True
+
 
 class FakeLocator:
     def __init__(self, page: "FakePage", selector: str) -> None:
@@ -162,6 +165,7 @@ class FakeContext:
 
 # Known send-button selectors (clicking them submits).
 SEND_SELECTORS = (
+    "button[aria-label='Send']",
     'button[data-testid="send-button"]',
     "#composer-submit-button",
     "button[aria-label='Send prompt']",
@@ -188,7 +192,8 @@ class FakePage:
 
     # ── submission model ────────────────────────────────────────────────
     def _maybe_submit_via_click(self, selector: str) -> None:
-        tokens = ("send-button", "composer-submit", "Send prompt", "prompt-textarea ~ button")
+        tokens = ("send-button", "composer-submit", "Send prompt", "prompt-textarea ~ button",
+                  "aria-label='Send']", 'aria-label="Send"]')
         if any(t in selector for t in tokens):
             self.stats.send_clicks += 1
             if self.explicit_submit_at is None and not self._submitted(self.clock.now_ms):
@@ -230,6 +235,11 @@ class FakePage:
         return "https://chatgpt.com/?temporary-chat=true"
 
     async def wait_for_selector(self, selector, timeout=None, state=None):
+        self.clock.advance(WAIT_SELECTOR)
+        return FakeElement(self, selector)
+
+    async def query_selector(self, selector):
+        # Same cost as a wait_for_selector hit: _find_selector now polls this.
         self.clock.advance(WAIT_SELECTOR)
         return FakeElement(self, selector)
 
@@ -299,6 +309,26 @@ class FakePage:
             self.clock.advance(EVAL_BASE)
             self.clipboard = ""
             return None
+
+        # Call sites of the shared detector._TURNS_JS prelude (assistantTurns()).
+        # Matched first: the prelude's own text contains markers used below.
+        if "assistantTurns()" in js:
+            if "turn.copy.click()" in js:
+                self.clock.advance(EVAL_BASE)
+                if self._copy_ready(now) and self._new_turn_present(now):
+                    self.clipboard = RESPONSE_TEXT
+                    return {"clicked": True, "reason": "ok", "signature": self._signature(now)}
+                return {"clicked": False, "reason": "no-copy-button", "signature": self._signature(now)}
+            if ".filter(turn => turn.copy).length" in js:
+                self.clock.advance(EVAL_BASE)
+                return 2 if self._copy_ready(now) else 1
+            if "return assistantTurns().length" in js:
+                self.clock.advance(EVAL_BASE)
+                return 2 if self._new_turn_present(now) else 1
+            if "return turn.text();" in js:
+                self.clock.advance(EVAL_BASE + RESPONSE_LEN * INNERTEXT_PER_CHAR)
+                return RESPONSE_TEXT
+            # the latest-turn snapshot falls through to its branch below
 
         # copy-button click extraction
         if "btn.click()" in js:

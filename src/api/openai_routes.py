@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import time
 import uuid
@@ -72,7 +73,11 @@ def _get_lock() -> asyncio.Lock:
 
 # Track messages in the current thread to prevent thread exhaustion
 _thread_message_count = 0
-_MAX_THREAD_MESSAGES = 8  # Start a new chat after this many requests
+# Start a new chat after this many requests. Default 1: every request gets a fresh
+# temporary chat. Each request already carries its full flattened history, so a shared
+# chat only leaks earlier requests (their tools and replies) into later ones. Raise via
+# CATGPT_THREAD_MESSAGES to trade that isolation for speed.
+_MAX_THREAD_MESSAGES = max(1, int(os.getenv("CATGPT_THREAD_MESSAGES", "1")))
 _last_response_time: float = 0.0
 _MIN_MESSAGE_GAP = 3.0  # Minimum seconds between messages (ChatGPT needs cooldown)
 
@@ -108,10 +113,14 @@ async def _ensure_fresh_chat() -> None:
     if Config.PROVIDER == "chatgpt":
         # ChatGPT: require a temporary chat so nothing is saved to history.
         try:
-            on_temp_chat = "temporary-chat=true" in (client.page.url or "")
+            page_url = client.page.url or ""
         except Exception:
-            on_temp_chat = False
-        if not on_temp_chat:
+            page_url = ""
+        if "temporary-chat=true" not in page_url:
+            needs_new = True
+        elif _MAX_THREAD_MESSAGES == 1 and "/c/" in page_url:
+            # Isolation mode: a /c/<id> URL means this chat already holds a request,
+            # including one that failed (the success counter never saw it).
             needs_new = True
 
     if not needs_new:
@@ -130,6 +139,21 @@ async def _ensure_fresh_chat() -> None:
             log.error(f"new_chat() retry also failed: {e2}")
             # Don't raise — continue with current thread rather than failing
             log.warning("Continuing with current thread despite new_chat failure")
+
+
+def _reject_empty_reply(text: str | None) -> None:
+    """Fail loudly instead of returning an empty 200.
+
+    An empty extraction is how ChatGPT's rate limiting (HTTP 429 in the page) shows up:
+    it refuses the message and no reply is ever rendered. Returning 502 lets clients
+    retry or back off instead of treating silence as an answer.
+    """
+    if not (text or "").strip():
+        raise HTTPException(
+            status_code=502,
+            detail="ChatGPT returned an empty response (it may be rate-limiting this "
+            "session); retry in a minute or two",
+        )
 
 
 def _increment_thread_count() -> None:
@@ -621,11 +645,34 @@ Each array item is an object with a `name` field (one of the available names lis
 Escape every double-quote that appears inside a string value, prefer single quotes inside shell commands, and include no placeholders, ellipsis, comments, or trailing commas.
 Derive the answer solely from the request above; do not use built-in web search or other assistants."""
 
-    return """FINAL TOOL-CALL PROTOCOL REMINDER:
-The available functions above are real tools the caller executes for you; their results come back in a follow-up message.
-If a function is needed for the user's last request and has not already returned that result, output ONLY a JSON tool-call code block.
-Otherwise answer in plain text.
-Do not use native ChatGPT browsing/search/tools instead of these functions."""
+    # Auto mode is framed as a structured-output choice between two reply shapes, like
+    # the forced modes above: ChatGPT cooperates with a schema but ignores "decide
+    # whether to use tools" and reaches for its own built-in search instead.
+    return """FINAL RESPONSE FORMAT (call a function or answer):
+Respond with ONLY a raw JSON object — no Markdown, no prose, no language label — in exactly one of these two shapes:
+
+1. Call a function (the default):
+{"tool_calls":[{"name":"<one of the available names>","arguments":{}}]}
+
+2. Answer directly:
+{"answer":"<your complete reply as plain text>"}
+
+Choose shape 2 ONLY for requests you can answer entirely from your own knowledge (explanations, math, writing). You cannot see the user's files, directories, repositories, commands, running systems or live data: the listed functions are the only way to reach them, and the caller runs them for you and returns the results in the next message. So any request that mentions a path, file, directory, command, repository, or current or external information MUST use shape 1 with the matching function. Your own sandbox, code execution and browsing tools run on a different machine that cannot see any of those things, so do not run or search anything yourself and do not look for these paths there: just reply with the JSON object. Never say that a path does not exist, or that you could not read or run something, unless a function result above says so.
+
+- `arguments` is a JSON object of real values matching that function's schema; no placeholders, ellipsis, comments, or trailing commas.
+- Escape every double-quote that appears inside a string value.
+- Do not use built-in web search, code execution, or other assistants.
+- Tool results from the caller appear above. If a result already answers the request, reply with shape 2. If more work is needed, reply with shape 1, never repeating a call that already returned its result."""
+
+
+def _unwrap_answer(text: str | None) -> str | None:
+    """Return the string from an auto-mode ``{"answer": "..."}`` reply, else None."""
+    if not text or "answer" not in text:
+        return None
+    candidate = _extract_json_object(text, "answer")
+    loaded = _json_loads_tolerant(candidate) if candidate else None
+    answer = loaded[0].get("answer") if loaded else None
+    return answer if isinstance(answer, str) else None
 
 
 def _append_tool_protocol_suffix(
@@ -1150,6 +1197,7 @@ async def _run_completion(request: ChatCompletionRequest) -> ChatCompletionRespo
 
         response_text = result.message
         elapsed_ms = int((time.time() - start_time) * 1000)
+        _reject_empty_reply(response_text)
 
         # ── Detect echo (extraction grabbed sent prompt instead of reply) ──
         _echo_markers = ["[System instruction:", "tool-calling mode", "Available functions:"]
@@ -1186,6 +1234,8 @@ async def _run_completion(request: ChatCompletionRequest) -> ChatCompletionRespo
                 finish_reason = "tool_calls"
                 # When the model calls tools, content should be null
                 response_text = None
+            else:
+                response_text = _unwrap_answer(response_text) or response_text
 
         # ── Bad-call retry (bounded to one correction turn) ──────────────
         # Default handling when a tool call is needed but the model made a
@@ -1355,9 +1405,8 @@ def _responses_input_to_messages(
                 text_parts = []
                 for part in content:
                     if isinstance(part, dict):
-                        if part.get("type") == "input_text":
-                            text_parts.append(part.get("text", ""))
-                        elif part.get("type") == "text":
+                        # output_text = earlier assistant turns replayed by the client
+                        if part.get("type") in ("input_text", "output_text", "text"):
                             text_parts.append(part.get("text", ""))
                     elif isinstance(part, str):
                         text_parts.append(part)
@@ -1713,6 +1762,7 @@ async def create_response(request: ResponsesRequest):
 
         response_text = result.message
         elapsed_ms = int((time.time() - start_time) * 1000)
+        _reject_empty_reply(response_text)
 
         # ── Detect echo ────────────────────────────────────
         _echo_markers = [
@@ -1761,29 +1811,21 @@ async def create_response(request: ResponsesRequest):
             tool_calls = _parse_tool_calls(response_text, chat_tools)
             if tool_calls:
                 response_text = None
+            else:
+                response_text = _unwrap_answer(response_text) or response_text
 
-        # ── Forced-tool retry (bounded to one correction turn) ──────────
-        # Mirror of the chat-completions retry: a forced/required tool call
-        # that failed to parse gets a single short correction in the same
-        # thread. Parse only the retry text; never after a tool result.
+        # ── Bad-call retry (bounded to one correction turn) ──────────────
+        # Same policy as chat completions: a forced/required parse miss, or an
+        # auto-mode meta-refusal, gets one correction turn in the same thread.
+        bad_call = force_tool_protocol or _looks_like_tool_refusal(response_text)
         if (
             not tool_calls
-            and force_tool_protocol
+            and has_tool_prompt
+            and bad_call
             and not any(msg.role == "tool" for msg in messages)
         ):
             forced_name = _forced_tool_name_from_choice(request.tool_choice)
-            skeleton = (
-                f'{{"tool_calls":[{{"name":"{forced_name}","arguments":{{}}}}]}}'
-                if forced_name
-                else '{"tool_calls":[{"name":"<an available name>","arguments":{}}]}'
-            )
-            correction = (
-                "Your previous response was not a valid JSON object. Ignore it "
-                "and reply with ONLY the corrected raw JSON object, exactly this "
-                f"shape: {skeleton}. Escape every double-quote inside string "
-                "values, prefer single quotes inside shell commands, and output "
-                "no prose and no code fence."
-            )
+            correction = _build_bad_call_correction(forced_name, force_tool_protocol)
             try:
                 retry_result = await client.send_message(correction)
                 retry_text = retry_result.message if retry_result else None
@@ -1792,9 +1834,13 @@ async def create_response(request: ResponsesRequest):
                     if retry_calls:
                         tool_calls = retry_calls
                         response_text = None
-                        log.info("Forced tool-call retry succeeded after parse miss")
+                        log.info("Bad-call retry produced a tool call")
+                    elif not force_tool_protocol and not _looks_like_tool_refusal(retry_text):
+                        # Auto mode: keep the clean answer, drop the refusal.
+                        response_text = retry_text
+                        log.info("Bad-call retry produced a direct answer")
             except Exception as e:
-                log.warning(f"Forced tool-call retry send failed: {e}")
+                log.warning(f"Bad-call retry send failed: {e}")
 
         # ── Build response ──────────────────────────────────
         prompt_tokens = _estimate_tokens(prompt)
