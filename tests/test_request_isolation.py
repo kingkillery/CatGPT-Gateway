@@ -41,15 +41,15 @@ def ask(client: FakeClient, text: str = "hi"):
 
 class RequestIsolationTest(unittest.TestCase):
     def setUp(self) -> None:
-        self._saved = (openai_routes._client, openai_routes._thread_message_count,
+        self._saved = (openai_routes._client, openai_routes._pool,
                        openai_routes._last_response_time, openai_routes._lock)
-        openai_routes._thread_message_count = 0
+        openai_routes._pool = None
         openai_routes._last_response_time = 0.0
         openai_routes._lock = None  # a fresh lock per asyncio.run() loop
         self.addCleanup(self._restore)
 
     def _restore(self) -> None:
-        (openai_routes._client, openai_routes._thread_message_count,
+        (openai_routes._client, openai_routes._pool,
          openai_routes._last_response_time, openai_routes._lock) = self._saved
 
     def use(self, client: FakeClient) -> FakeClient:

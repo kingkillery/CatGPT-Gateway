@@ -333,6 +333,50 @@ class ChatGPTClient:
         except Exception:
             return False
 
+    async def _composer_empty(self) -> bool:
+        """True when the visible composer holds no (leftover, unsent) text."""
+        try:
+            return bool(await self._page.evaluate(
+                "(sels) => { for (const s of sels) { const c = document.querySelector(s);"
+                " if (c && (c.offsetWidth || c.offsetHeight)) return (c.innerText || c.value || '').trim() === ''; }"
+                " return false; }",
+                list(Selectors.CHAT_INPUT),
+            ))
+        except Exception:
+            return False
+
+    async def _soft_new_temporary_chat(self) -> bool:
+        """Switch the loaded app to an empty temporary chat without reloading the document.
+
+        A client-side route change takes well under a second and stays temporary. The
+        in-page "New chat" button does not: it opens a normal chat that is saved to the
+        history. Returns False (the caller then reloads) if anything looks off.
+
+        Only conversation pages (/c/<id>) switch this way. From the plain "/" page the router
+        sees the same path and nothing changes, so that one reload is left to the caller.
+        """
+        url = self._page.url or ""
+        if "chatgpt.com" not in url or "/c/" not in url:
+            return False
+        try:
+            await self._page.evaluate(
+                "() => { history.pushState({}, '', '/?temporary-chat=true');"
+                " window.dispatchEvent(new PopStateEvent('popstate')); }"
+            )
+            deadline = time.monotonic() + 8
+            settled = 0  # two clean polls in a row, so an unmounting old conversation is not mistaken for an empty one
+            while time.monotonic() < deadline:
+                if await self._is_fresh_temporary_chat() and await self._composer_empty():
+                    settled += 1
+                    if settled >= 2:
+                        return True
+                else:
+                    settled = 0
+                await asyncio.sleep(0.25)
+        except Exception as e:
+            log.debug(f"In-page new chat failed: {e}")
+        return False
+
     async def new_chat(self) -> None:
         """Start a new conversation.
 
@@ -340,14 +384,19 @@ class ChatGPTClient:
         conversations are NOT saved to the sidebar history.
 
         Strategy order:
-        1. JavaScript location change to the temporary-chat URL (no DNS lookup)
-        2. Full page.goto() to the temporary-chat URL (last resort)
+        1. In-page route change to the temporary-chat URL (no reload)
+        2. JavaScript location change to the temporary-chat URL (reloads the page)
+        3. Full page.goto() to the temporary-chat URL (last resort)
         """
         # Already on a fresh temporary chat — nothing to do. A normal empty
         # "/" chat is NOT skipped, because we specifically want temporary chats
         # so the conversation does not clutter the sidebar history.
         if await self._is_fresh_temporary_chat():
             log.info("Already on a fresh temporary chat — skipping navigation")
+            return
+
+        if await self._soft_new_temporary_chat():
+            log.info("Temporary chat started in-page (no reload)")
             return
 
         # Strategy 1: Navigate to a temporary chat directly. Prefer this over

@@ -26,7 +26,8 @@ from src.chatgpt.client import ChatGPTClient
 from src.claude.client import ClaudeClient
 from src.config import Config
 from src.api.routes import router, set_client
-from src.api.openai_routes import openai_router, set_openai_client
+from src.api import openai_routes
+from src.api.openai_routes import add_openai_tab, openai_router, set_openai_client
 from src.api.files_routes import files_router
 from src.log import setup_logging
 
@@ -35,6 +36,44 @@ log = setup_logging("api_server")
 # Global instances — needed for lifespan
 _browser: BrowserManager | None = None
 _client: ChatGPTClient | ClaudeClient | None = None
+
+
+async def _open_tabs(browser: BrowserManager, primary: ChatGPTClient, count: int) -> None:
+    """Put the primary tab on an empty temporary chat, then open `count` spare tabs the same way.
+
+    Each tab costs one page load here so that a new conversation never pays one later. Each
+    runs under the request lock: a tab opening in front of a running request would put its
+    page in the background, where the browser throttles it. A failure leaves fewer tabs.
+    """
+    try:
+        async with openai_routes._get_lock():
+            await primary.new_chat()  # the plain "/" page cannot switch in-page, so this is the one reload
+        log.info("Primary tab ready on an empty temporary chat")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.warning(f"Could not prepare the primary tab: {e}")
+
+    temp_url = f"{Config.CHATGPT_URL.rstrip('/')}/?temporary-chat=true"
+    for n in range(1, count + 1):
+        page = None
+        try:
+            async with openai_routes._get_lock():
+                page = await browser.context.new_page()
+                await page.goto(temp_url, wait_until="domcontentloaded", timeout=30000)
+                client = ChatGPTClient(page)
+                await client._wait_for_chat_input()
+                add_openai_tab(client)
+            log.info(f"Spare tab {n}/{count} ready")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning(f"Could not open spare tab {n}/{count}: {e}")
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
 
 
 @asynccontextmanager
@@ -89,9 +128,17 @@ async def lifespan(app: FastAPI):
     set_openai_client(_client)
     log.info(f"API server ready — browser launched, logged in to {provider_name}")
 
+    # More tabs let several conversations keep their own ChatGPT thread. They open in the
+    # background so the API is available at once with the primary tab.
+    spare_tabs = None
+    if Config.PROVIDER == "chatgpt":
+        spare_tabs = asyncio.create_task(_open_tabs(_browser, _client, Config.TABS - 1))
+
     yield  # Server is running
 
     log.info("Shutting down — closing browser...")
+    if spare_tabs is not None:
+        spare_tabs.cancel()
     await _browser.close()
     log.info("Browser closed")
 

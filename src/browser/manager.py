@@ -384,24 +384,26 @@ class BrowserManager:
         await self.page.goto(url, wait_until="domcontentloaded")
         log.info("Page loaded")
 
-    async def recover_page(self) -> bool:
+    async def recover_page(self, page: Page | None = None) -> bool:
         """Recover from DNS / page errors by re-navigating to ChatGPT.
 
         Tries JS navigation first (avoids DNS lookup), then page.goto().
+        Recovers the given tab, or the primary page when none is given.
         Returns True if recovery succeeded, False otherwise.
         """
         import asyncio as _asyncio
 
-        if self._page is None:
+        page = page or self._page
+        if page is None:
             return False
 
         # Strategy 1: JS navigation (doesn't go through Chrome's DNS resolver)
         try:
             log.info("Page recovery via JS navigation...")
-            await self._page.evaluate(f"window.location.href = '{Config.CHATGPT_URL}'")
-            await self._page.wait_for_load_state("domcontentloaded", timeout=15000)
+            await page.evaluate(f"window.location.href = '{Config.CHATGPT_URL}'")
+            await page.wait_for_load_state("domcontentloaded", timeout=15000)
             await _asyncio.sleep(1)
-            error = await self._page.evaluate(
+            error = await page.evaluate(
                 """
                 () => {
                     const body = document.body ? document.body.innerText : '';
@@ -423,14 +425,14 @@ class BrowserManager:
         for attempt in range(1, 4):
             try:
                 log.info(f"Page recovery attempt {attempt}/3 (page.goto)...")
-                await self._page.goto(
+                await page.goto(
                     Config.CHATGPT_URL,
                     wait_until="domcontentloaded",
                     timeout=30000,
                 )
                 await _asyncio.sleep(1)
 
-                error = await self._page.evaluate(
+                error = await page.evaluate(
                     """
                     () => {
                         const body = document.body ? document.body.innerText : '';

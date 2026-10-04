@@ -12,6 +12,7 @@ Playwright browser page is single-threaded.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -23,6 +24,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from src.api import bridge, cleanup, formatter
+from src.api.tabs import Tab, TabPool
 from src.api.openai_schemas import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -72,74 +74,132 @@ def _get_lock() -> asyncio.Lock:
     return _lock
 
 
-# Track messages in the current thread to prevent thread exhaustion
-_thread_message_count = 0
-# Start a new chat after this many requests. Default 1: every request gets a fresh
-# temporary chat. Each request already carries its full flattened history, so a shared
-# chat only leaks earlier requests (their tools and replies) into later ones. Raise via
-# CATGPT_THREAD_MESSAGES to trade that isolation for speed.
-_MAX_THREAD_MESSAGES = max(1, int(os.getenv("CATGPT_THREAD_MESSAGES", "1")))
+# Tabs, each holding one ChatGPT thread (see src/api/tabs.py). A request that provably
+# continues a tab's thread goes back to that tab and sends only its new messages; any other
+# request gets an empty chat, so unrelated conversations never share context. This only caps
+# how many requests one thread serves before a fresh chat is started.
+_MAX_THREAD_MESSAGES = max(1, int(os.getenv("CATGPT_THREAD_MESSAGES", "12")))
+_THREAD_IDLE_SECONDS = float(os.getenv("CATGPT_THREAD_IDLE_SECONDS", "1800"))
+_pool: TabPool | None = None
 _last_response_time: float = 0.0
 _MIN_MESSAGE_GAP = 3.0  # Minimum seconds between messages (ChatGPT needs cooldown)
 
 
-async def _ensure_fresh_chat() -> None:
-    """Enforce cooldown and ensure the next message is sent in a fresh chat.
+def _get_pool() -> TabPool:
+    """The tab pool, created on first use with the primary client's tab."""
+    global _pool
+    if _pool is None:
+        # Claude has no temporary chats, so it keeps one request per chat.
+        _pool = TabPool(
+            max_turns=_MAX_THREAD_MESSAGES if Config.PROVIDER == "chatgpt" else 1,
+            idle_seconds=_THREAD_IDLE_SECONDS,
+        )
+        _pool.add(_get_client())
+    return _pool
 
-    For ChatGPT we keep every conversation in a TEMPORARY chat
-    (?temporary-chat=true) so it is never saved to the sidebar history: a new
-    temporary chat is started whenever the page is not already on one, or when
-    the current thread has accumulated enough messages that ChatGPT's UI starts
-    to degrade (~6-8). Conversation context is flattened into each prompt, so a
-    fresh chat never loses memory. Claude has no temporary-chat mode, so it
-    keeps the count-based rotation only.
 
-    Also enforces a minimum gap between consecutive messages, since the UI may
-    not accept rapid-fire messages properly.
-    """
-    global _thread_message_count, _last_response_time
-
-    # Enforce minimum gap between messages
-    if _last_response_time > 0:
-        elapsed = time.time() - _last_response_time
-        if elapsed < _MIN_MESSAGE_GAP:
-            wait = _MIN_MESSAGE_GAP - elapsed
-            log.debug(f"Cooldown: waiting {wait:.1f}s before next message")
-            await asyncio.sleep(wait)
-
-    client = _get_client()
-
-    # Decide whether to (re)start a chat.
-    needs_new = _thread_message_count >= _MAX_THREAD_MESSAGES
+async def _start_chat(client) -> None:
+    """Put a tab on an empty chat. ChatGPTClient.new_chat() switches in-page and reloads only
+    as a fallback; ChatGPT chats are always temporary so nothing is saved to the history."""
     if Config.PROVIDER == "chatgpt":
-        # ChatGPT: require a temporary chat so nothing is saved to history.
         try:
             page_url = client.page.url or ""
         except Exception:
             page_url = ""
-        if "temporary-chat=true" not in page_url:
-            needs_new = True
-        elif _MAX_THREAD_MESSAGES == 1 and "/c/" in page_url:
-            # Isolation mode: a /c/<id> URL means this chat already holds a request,
-            # including one that failed (the success counter never saw it).
-            needs_new = True
-
-    if not needs_new:
-        return  # Already on a usable (temporary) chat — no navigation needed
+        if "temporary-chat=true" in page_url and "/c/" not in page_url:
+            return  # already an empty temporary chat
 
     try:
         await client.new_chat()
-        _thread_message_count = 0
     except Exception as e:
         log.warning(f"new_chat() failed, retrying once: {e}")
         try:
             await asyncio.sleep(2)
             await client.new_chat()
-            _thread_message_count = 0
         except Exception as e2:
             log.error(f"new_chat() retry also failed: {e2}")
             # Don't raise — continue with current thread rather than failing
             log.warning("Continuing with current thread despite new_chat failure")
+
+
+async def _prepare_tab(tab: Tab, reuse: bool) -> None:
+    """Enforce the cooldown, bring the tab forward, and empty its chat unless continuing it.
+
+    The minimum gap exists because the UI may not accept rapid-fire messages properly.
+    """
+    if _last_response_time > 0:
+        wait = _MIN_MESSAGE_GAP - (time.time() - _last_response_time)
+        if wait > 0:
+            log.debug(f"Cooldown: waiting {wait:.1f}s before next message")
+            await asyncio.sleep(wait)
+    try:
+        await tab.client.page.bring_to_front()  # the browser throttles background tabs
+    except Exception:
+        pass
+    if not reuse:
+        await _start_chat(tab.client)
+
+
+def _fingerprint(msg: ChatMessage) -> str:
+    """Identity of a message as a client replays it, so a tab's thread can be matched against
+    later history. Tool-call ids are left out: only the call and its arguments matter."""
+    calls = []
+    for tc in msg.tool_calls or []:
+        args = tc.function.arguments
+        try:
+            args = json.dumps(json.loads(args), sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            args = str(args).strip()
+        calls.append([tc.function.name, args])
+    text = " ".join(_extract_content_text(msg.content).split())
+    blob = json.dumps([msg.role, text, calls], ensure_ascii=False)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _lease_tab(messages: list[ChatMessage], intensity: str | None) -> tuple[Tab, int, list[str]]:
+    """Choose and claim a tab for a request: (tab, start, fingerprints).
+    messages[:start] are already in the tab's thread, so only the rest is sent."""
+    pool = _get_pool()
+    fps = [_fingerprint(m) for m in messages]
+    tab, start = pool.pick(fps, intensity)
+    if start:
+        log.info(f"Tab {pool.index(tab)}: continuing its thread "
+                 f"({start} messages already there, {len(fps) - start} new)")
+    else:
+        log.info(f"Tab {pool.index(tab)}: new conversation ({pool.last_miss or 'no thread to continue'})")
+    pool.lease(tab)
+    return tab, start, fps
+
+
+def _remember_turn(
+    tab: Tab, fps: list[str], intensity: str | None, start: int,
+    reply_text: str | None, reply_calls: list[ToolCall] | None,
+) -> None:
+    """Record that the tab's thread now holds the request's messages plus our reply."""
+    reply = ChatMessage(role="assistant", content=reply_text, tool_calls=reply_calls)
+    _get_pool().remember(tab, fps + [_fingerprint(reply)], intensity, continued=start > 0)
+
+
+def _compose_prompt(messages: list[ChatMessage], start: int, tools_active: bool, tool_choice) -> str:
+    """The text to send: the whole transcript, or only what a continued thread has not seen."""
+    prompt = _build_prompt(messages[start:], names_from=messages) if start else _build_prompt(messages)
+    if tools_active:
+        prompt = _append_tool_protocol_suffix(prompt, messages, tool_choice)
+    return prompt
+
+
+async def _send_prompt(client, prompt: str, full_prompt: str, start: int, **attachments):
+    """Send the prompt. If continuing a thread fails, retry once in an empty chat with the full
+    history. Returns (result, start); start is 0 when the fallback ran. Attachments from messages
+    the continuation skipped are not re-sent on the fallback."""
+    try:
+        return await client.send_message(prompt, **attachments), start
+    except Exception as e:
+        if not start:
+            raise
+        log.warning(f"Continuing the thread failed ({e}); retrying in a fresh chat with the full history")
+        await _start_chat(client)
+        return await client.send_message(full_prompt, **attachments), 0
 
 
 def _reject_empty_reply(text: str | None) -> None:
@@ -157,12 +217,10 @@ def _reject_empty_reply(text: str | None) -> None:
         )
 
 
-def _increment_thread_count() -> None:
-    """Increment the thread message counter after a successful response."""
-    global _thread_message_count, _last_response_time
-    _thread_message_count += 1
+def _note_response() -> None:
+    """Remember when the last response finished, for the cooldown between messages."""
+    global _last_response_time
     _last_response_time = time.time()
-    log.debug(f"Thread message count: {_thread_message_count}/{_MAX_THREAD_MESSAGES}")
 
 
 def _get_model_id() -> str:
@@ -175,9 +233,15 @@ def _get_model_id() -> str:
 
 
 def set_openai_client(client: ChatGPTClient | ClaudeClient) -> None:
-    """Called by server.py to inject the client."""
-    global _client
+    """Called by server.py to inject the primary client (its tab starts a new pool)."""
+    global _client, _pool
     _client = client
+    _pool = None
+
+
+def add_openai_tab(client: ChatGPTClient) -> None:
+    """Called by server.py when another pre-opened tab is ready to take conversations."""
+    _get_pool().add(client)
 
 
 def _get_client() -> ChatGPTClient | ClaudeClient:
@@ -364,7 +428,7 @@ async def _download_file(url_or_data: str | dict, download_dir: str = "/tmp/catg
         return None
 
 
-def _build_prompt(messages: list[ChatMessage]) -> str:
+def _build_prompt(messages: list[ChatMessage], names_from: list[ChatMessage] | None = None) -> str:
     """
     Flatten an OpenAI-style message array into a single prompt string
     that we can paste into ChatGPT's input box.
@@ -373,6 +437,9 @@ def _build_prompt(messages: list[ChatMessage]) -> str:
     so for simple single-turn calls we just send the last user message.
     For multi-turn with system prompts or tool results, we build a
     formatted transcript.
+
+    When only the new tail of a conversation is sent (a continued thread), pass the
+    whole history as names_from so tool results can still name the call they answer.
     """
     # Simple case: only one user message (and optionally one system message)
     non_system = [m for m in messages if m.role != "system"]
@@ -400,7 +467,7 @@ def _build_prompt(messages: list[ChatMessage]) -> str:
     parts: list[str] = []
     call_names = {
         tc.id: tc.function.name
-        for m in messages
+        for m in (names_from or messages)
         if m.role == "assistant" and m.tool_calls
         for tc in m.tool_calls
     }
@@ -943,7 +1010,7 @@ async def create_image(
             detail="Image generation is not supported by Claude. This feature is only available with the ChatGPT provider.",
         )
 
-    client = _get_client()
+    _get_client()  # 503 until the browser is up
 
     async with _get_lock():
         start_time = time.time()
@@ -968,8 +1035,10 @@ async def create_image(
             f"n={request.n}, size={request.size}, response_format={request.response_format}"
         )
 
-        # Start a fresh conversation to avoid thread exhaustion
-        await _ensure_fresh_chat()
+        # Always an empty chat; the tab's thread stays unknown afterwards (leased, never remembered)
+        tab, _, _ = _lease_tab([], None)
+        client = tab.client
+        await _prepare_tab(tab, reuse=False)
 
         # Send to ChatGPT
         try:
@@ -1038,7 +1107,7 @@ async def create_image(
             f"{elapsed_ms}ms, format={request.response_format}"
         )
 
-        _increment_thread_count()
+        _note_response()
         return ImagesResponse(data=image_data_list)
 
 
@@ -1155,7 +1224,7 @@ async def _run_completion(request: ChatCompletionRequest) -> ChatCompletionRespo
         if routed:
             return routed
 
-    client = _get_client()
+    _get_client()  # 503 until the browser is up
 
     async with _get_lock():
         start_time = time.time()
@@ -1174,13 +1243,17 @@ async def _run_completion(request: ChatCompletionRequest) -> ChatCompletionRespo
             messages.insert(0, ChatMessage(role="system", content=tool_system))
             has_tool_prompt = True
 
-        prompt = _build_prompt(messages)
+        tab, start, fps = _lease_tab(messages, request.intensity)
+        client = tab.client
+        thread_dirty = False  # set when we add turns the client's history will not contain
+        prompt = _compose_prompt(messages, start, has_tool_prompt, request.tool_choice)
+        full_prompt = (
+            _compose_prompt(messages, 0, has_tool_prompt, request.tool_choice) if start else prompt
+        )
         force_tool_protocol = (
             _forced_tool_name_from_choice(request.tool_choice) is not None
             or request.tool_choice == "required"
         )
-        if has_tool_prompt:
-            prompt = _append_tool_protocol_suffix(prompt, messages, request.tool_choice)
         log.info(
             f"POST /v1/chat/completions — model={request.model}, "
             f"{len(request.messages)} messages, prompt={len(prompt)} chars"
@@ -1189,7 +1262,7 @@ async def _run_completion(request: ChatCompletionRequest) -> ChatCompletionRespo
         # ── Extract attachments from messages ──────────────
         image_paths: list[str] = []
         file_paths: list[str] = []
-        for msg in request.messages:
+        for msg in messages[start:]:  # a continued thread already has the earlier attachments
             if msg.role == "user" and isinstance(msg.content, list):
                 # Images (OpenAI vision format)
                 image_urls = _extract_image_urls(msg.content)
@@ -1208,11 +1281,11 @@ async def _run_completion(request: ChatCompletionRequest) -> ChatCompletionRespo
         if all_attachment_paths:
             log.info(f"Extracted {len(image_paths)} image(s) and {len(file_paths)} file(s) from request")
 
-        # Start a fresh conversation to avoid thread exhaustion
-        await _ensure_fresh_chat()
+        # Continue the tab's thread, or move it to an empty chat (in-page, no reload)
+        await _prepare_tab(tab, reuse=bool(start))
 
         # ── Switch model intensity if requested ─────────────
-        if request.intensity:
+        if request.intensity and not start:  # a continued thread already has it applied
             intensity = request.intensity.strip().lower()
             log.info(f"Requested intensity: {intensity}")
             if isinstance(client, ChatGPTClient):
@@ -1226,15 +1299,16 @@ async def _run_completion(request: ChatCompletionRequest) -> ChatCompletionRespo
                         f"No model option matched intensity '{intensity}': {selection.reason}"
                     )
                     # Fallback: prepend intensity hint to the prompt
-                    prompt = (
+                    hint = (
                         f"[Requested reasoning intensity: {intensity}. "
-                        f"Use the closest available mode for this answer.]\n\n{prompt}"
+                        "Use the closest available mode for this answer.]\n\n"
                     )
+                    prompt, full_prompt = hint + prompt, hint + full_prompt
 
         # ── Send to provider ────────────────────────────────
         try:
-            result = await client.send_message(
-                prompt,
+            result, start = await _send_prompt(
+                client, prompt, full_prompt, start,
                 image_paths=image_paths or None,
                 file_paths=file_paths or None,
             )
@@ -1314,6 +1388,7 @@ async def _run_completion(request: ChatCompletionRequest) -> ChatCompletionRespo
                     return routed
             forced_name = _forced_tool_name_from_choice(request.tool_choice)
             correction = _build_bad_call_correction(forced_name, force_tool_protocol)
+            thread_dirty = True  # the correction and its reply are in the thread, not in the client's history
             try:
                 retry_result = await client.send_message(correction)
                 retry_text = retry_result.message if retry_result else None
@@ -1361,7 +1436,9 @@ async def _run_completion(request: ChatCompletionRequest) -> ChatCompletionRespo
             f"tokens≈{response.usage.total_tokens}"
         )
 
-        _increment_thread_count()
+        if not thread_dirty:
+            _remember_turn(tab, fps, request.intensity, start, response_text, tool_calls)
+        _note_response()
         return response
 
 
@@ -1727,7 +1804,7 @@ async def create_response(request: ResponsesRequest):
     if not request.input:
         raise HTTPException(status_code=400, detail="input cannot be empty")
 
-    client = _get_client()
+    _get_client()  # 503 until the browser is up
 
     async with _get_lock():
         start_time = time.time()
@@ -1755,35 +1832,40 @@ async def create_response(request: ResponsesRequest):
                 )
                 has_tool_prompt = True
 
-        prompt = _build_prompt(messages)
+        tab, start, fps = _lease_tab(messages, None)
+        client = tab.client
+        thread_dirty = False  # set when we add turns the client's history will not contain
+        prompt = _compose_prompt(messages, start, has_tool_prompt, request.tool_choice)
+        full_prompt = (
+            _compose_prompt(messages, 0, has_tool_prompt, request.tool_choice) if start else prompt
+        )
         force_tool_protocol = (
             _forced_tool_name_from_choice(request.tool_choice) is not None
             or request.tool_choice == "required"
         )
-        if has_tool_prompt:
-            prompt = _append_tool_protocol_suffix(prompt, messages, request.tool_choice)
         log.info(
             f"POST /v1/responses — model={request.model}, "
             f"input_type={'string' if isinstance(request.input, str) else 'array'}, "
             f"prompt={len(prompt)} chars, stream={request.stream}"
         )
 
-        # Start a fresh conversation to avoid thread exhaustion
-        await _ensure_fresh_chat()
+        # Continue the tab's thread, or move it to an empty chat (in-page, no reload)
+        await _prepare_tab(tab, reuse=bool(start))
 
         # ── Send to browser ────────────────────────────────
         try:
-            result = await client.send_message(prompt)
+            result, start = await _send_prompt(client, prompt, full_prompt, start)
         except RuntimeError as e:
             err_msg = str(e).lower()
             if "error state" in err_msg or "could not find chat input" in err_msg:
                 # Page has a DNS/navigation error or UI is broken — attempt recovery
                 log.warning(f"Page error detected, attempting recovery: {e}")
                 from src.api.server import _browser
-                if _browser and await _browser.recover_page():
-                    # Retry after recovery
+                if _browser and await _browser.recover_page(client.page):
+                    # Retry after recovery: the page is a new chat, so send the full history
+                    start = 0
                     try:
-                        result = await client.send_message(prompt)
+                        result = await client.send_message(full_prompt)
                     except Exception as e2:
                         log.error(f"Provider error after recovery: {e2}", exc_info=True)
                         raise HTTPException(
@@ -1804,9 +1886,10 @@ async def create_response(request: ResponsesRequest):
             if "TargetClosed" in err_name or "closed" in str(e).lower():
                 log.warning(f"Browser/page crashed ({err_name}), attempting recovery...")
                 from src.api.server import _browser
-                if _browser and await _browser.recover_page():
+                if _browser and await _browser.recover_page(client.page):
+                    start = 0  # the page is a new chat, so send the full history
                     try:
-                        result = await client.send_message(prompt)
+                        result = await client.send_message(full_prompt)
                     except Exception as e2:
                         log.error(f"Provider error after crash recovery: {e2}", exc_info=True)
                         raise HTTPException(
@@ -1890,6 +1973,7 @@ async def create_response(request: ResponsesRequest):
         ):
             forced_name = _forced_tool_name_from_choice(request.tool_choice)
             correction = _build_bad_call_correction(forced_name, force_tool_protocol)
+            thread_dirty = True  # the correction and its reply are in the thread, not in the client's history
             try:
                 retry_result = await client.send_message(correction)
                 retry_text = retry_result.message if retry_result else None
@@ -1921,7 +2005,9 @@ async def create_response(request: ResponsesRequest):
             f"tokens≈{resp.usage.total_tokens if resp.usage else 0}"
         )
 
-        _increment_thread_count()
+        if not thread_dirty:
+            _remember_turn(tab, fps, None, start, response_text, tool_calls)
+        _note_response()
 
         # ── Stream or return ────────────────────────────────
         if request.stream:
