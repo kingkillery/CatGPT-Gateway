@@ -1,18 +1,25 @@
 """Deterministic reply cleanup: an ordered spec of small, pure, idempotent rules.
 
 No model, no network, no guessing: every rule is a plain string transform that either
-removes scraped-UI noise or fixes a well-known JSON slip. Two tiers:
+removes scraped-UI noise, fixes a well-known JSON slip, or maps a known variant of the
+reply shape onto the canonical one. Three tiers:
 
 TEXT_RULES   Applied to every reply before anything reads it. Remove what the browser
              scrape adds around ChatGPT's words; never rewrite the words themselves.
 JSON_RULES   Applied only to a candidate tool-call/answer object that failed a strict
              parse. They can change content inside the failing object, which is
              acceptable because the alternative was a failed call.
+SHAPE_SPEC   Applied to JSON that already parses but is not the canonical shape. Maps the
+             variants models emit (a bare call, a list, `parameters` for `arguments`, a
+             namespaced or differently cased tool name, ...) onto
+             {"name": <offered tool>, "arguments": <object>}. See normalize_calls().
 
 repair_json() runs the JSON tier and returns text that strict json parses, or None.
 It never invents arguments: unterminated strings and mismatched brackets are left
-broken (None) rather than guessed at. The optional OpenRouter formatter only sees what
-this spec could not fix.
+broken (None) rather than guessed at. normalize_calls() never invents a tool or an
+argument either: a name that is not one of the offered tools, or arguments that are not
+an object, drop the call. The optional OpenRouter formatter only sees what this spec
+could not fix.
 """
 
 from __future__ import annotations
@@ -246,3 +253,168 @@ def repair_json(text: str | None, anchor: str | None = None) -> str | None:
     for rule in JSON_RULES:
         cleaned = rule.apply(cleaned)
     return _object_at_start(cleaned)
+
+
+# ── Shape tier ────────────────────────────────────────────────────────
+
+# (name, why) in the order the steps run. Documentation the tests hold the code to.
+SHAPE_SPEC: tuple[tuple[str, str], ...] = (
+    ("whole_reply_value", "a non-canonical shape must be the entire reply, so a tool call quoted in prose is never run"),
+    ("tag_wrapper", "<tool_call>...</tool_call> around the JSON"),
+    ("stringified_json", "a value that is itself JSON text (tool_calls or arguments as a string)"),
+    ("find_calls", "a bare call, a list of calls, or a wrapper key: tool_calls/tool_call/function_call(s)/calls"),
+    ("name_aliases", "name under name/tool/tool_name/function_name, or function as a string or {name}"),
+    ("argument_aliases", "arguments under arguments/parameters/args/input/params; never silently dropped"),
+    ("resolve_tool_name", "namespace prefix (functions.), case, and _ - separators; one unique offered tool or no call"),
+    ("arguments_must_be_an_object", "unparseable or non-object arguments drop the call instead of passing garbage on"),
+    ("answer_aliases", "an answer under answer/response/reply/content/text/message, only if it is the whole reply"),
+)
+
+WRAPPER_KEYS = ("tool_calls", "tool_call", "function_calls", "function_call", "calls")
+NAME_KEYS = ("name", "tool", "tool_name", "function_name")
+ARGUMENT_KEYS = ("arguments", "parameters", "args", "input", "params")
+ANSWER_KEYS = ("answer", "response", "reply", "content", "text", "message")
+NAMESPACES = ("functions.", "function.", "tools.", "tool.", "default_api.")
+
+_TAG = re.compile(r"\A\s*<tool_call>\s*(.*?)\s*</tool_call>\s*\Z", re.DOTALL | re.IGNORECASE)
+
+
+def _lower(obj: dict) -> dict:
+    return {str(k).lower(): v for k, v in obj.items()}
+
+
+def _json_value(text: str) -> object:
+    """The one JSON object or list that is the entire text, repaired by JSON_RULES; else None."""
+    s = text.strip()
+    for candidate in (s, _apply_json_rules(s)):
+        try:
+            value, end = json.JSONDecoder().raw_decode(candidate)
+        except ValueError:
+            continue
+        if isinstance(value, (dict, list)) and not candidate[end:].strip():
+            return value
+    return None
+
+
+def _apply_json_rules(s: str) -> str:
+    for rule in JSON_RULES:
+        s = rule.apply(s)
+    return s
+
+
+def reply_json(text: str | None) -> object:
+    """The JSON object or list that is the ENTIRE reply (after labels, a fence, or
+    <tool_call> tags), repaired if needed. None when the reply is anything else, which is
+    what keeps a call mentioned in prose from ever being run."""
+    body = clean_text(text)
+    tagged = _TAG.match(body)
+    if tagged:
+        body = tagged.group(1)
+    fenced = re.fullmatch(r"```[A-Za-z0-9_-]*[ \t]*\n?(.*?)\n?```", body, re.DOTALL)
+    if fenced:
+        body = fenced.group(1)
+    return _json_value(body) if body[:1] in "{[" else None
+
+
+def _as_json(value: object) -> object:
+    """A string that holds JSON becomes that JSON; anything else, including a string that
+    does not parse, is returned as is (so it can never be mistaken for a null)."""
+    if isinstance(value, str) and value.strip()[:1] in ("{", "["):
+        parsed = _json_value(value)
+        return value if parsed is None else parsed
+    return value
+
+
+def _candidates(obj: object) -> list[dict]:
+    """The call-like objects inside a parsed reply, in order."""
+    obj = _as_json(obj)
+    if isinstance(obj, list):
+        return [c for item in obj for c in _candidates(item)]
+    if not isinstance(obj, dict):
+        return []
+    lower = _lower(obj)
+    for key in WRAPPER_KEYS:
+        if key in lower:
+            return _candidates(lower[key])
+    if any(k in lower for k in NAME_KEYS) or isinstance(lower.get("function"), (str, dict)):
+        return [obj]
+    return []
+
+
+def resolve_tool_name(raw: object, tool_names: list[str] | tuple[str, ...]) -> str | None:
+    """One of tool_names, or None. Exact first; then without a namespace prefix; then
+    ignoring case and _ - separators, but only when that leaves exactly one tool."""
+    if not isinstance(raw, str):
+        return None
+    name = raw.strip()
+    if name in tool_names:
+        return name
+    for prefix in NAMESPACES:
+        if name.lower().startswith(prefix):
+            name = name[len(prefix):]
+            break
+    if name in tool_names:
+        return name
+
+    def canon(s: str) -> str:
+        return re.sub(r"[\s_\-]+", "", s).lower()
+
+    matches = [t for t in tool_names if canon(t) == canon(name)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def normalize_call(call: dict, tool_names: list[str] | tuple[str, ...]) -> dict | None:
+    """{"name": <offered tool>, "arguments": <dict>} for one call-like object, or None."""
+    lower = _lower(call)
+    function = lower.get("function")
+    scope = lower
+    if isinstance(function, dict):
+        inner = _lower(function)
+        name = inner.get("name")
+        scope = {**lower, **inner}
+    else:
+        name = next((lower[k] for k in NAME_KEYS if isinstance(lower.get(k), str)), None)
+        name = name or (function if isinstance(function, str) else None)
+
+    resolved = resolve_tool_name(name, tool_names)
+    if resolved is None:
+        return None
+    key = next((k for k in ARGUMENT_KEYS if k in scope), None)
+    arguments = _as_json(scope[key]) if key else {}
+    if arguments is None:
+        arguments = {}
+    if not isinstance(arguments, dict):
+        return None
+    return {"name": resolved, "arguments": arguments}
+
+
+def normalize_calls(parsed: object, tool_names: list[str] | tuple[str, ...]) -> list[dict]:
+    """Every call in a parsed reply as canonical {"name", "arguments"}, offered tools only."""
+    out = [normalize_call(c, tool_names) for c in _candidates(parsed)]
+    return [c for c in out if c]
+
+
+def unwrap_answer(parsed: object) -> str | None:
+    """The text of a reply that is only an answer wrapper ({"response": "..."} and kin).
+
+    An object that carries any other key, or looks like a call, is not a plain answer.
+    """
+    parsed = _as_json(parsed)
+    if not isinstance(parsed, dict):
+        return None
+    lower = _lower(parsed)
+    if not lower or any(k in lower for k in (*WRAPPER_KEYS, *NAME_KEYS, "function")):
+        return None
+    if not set(lower) <= set(ANSWER_KEYS):
+        return None
+    for key in ANSWER_KEYS:
+        value = lower.get(key)
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            nested = unwrap_answer(value)
+            if nested is not None:
+                return nested
+        if isinstance(value, list) and value and all(isinstance(i, str) for i in value):
+            return "\n".join(value)
+    return None

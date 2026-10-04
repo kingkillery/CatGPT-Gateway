@@ -769,13 +769,20 @@ async def _repair_with_formatter(
 
 
 def _unwrap_answer(text: str | None) -> str | None:
-    """Return the string from an auto-mode ``{"answer": "..."}`` reply, else None."""
-    if not text or "answer" not in text:
+    """Return the string from an auto-mode ``{"answer": "..."}`` reply, else None.
+
+    A canonical answer may sit inside prose or a fence. Variants ({"response": ...},
+    {"content": ...}) count only when they are the entire reply.
+    """
+    if not text:
         return None
-    candidate = _extract_json_object(text, "answer") or cleanup.repair_json(text, anchor="answer")
-    loaded = _json_loads_tolerant(candidate) if candidate else None
-    answer = loaded[0].get("answer") if loaded else None
-    return answer if isinstance(answer, str) else None
+    if "answer" in text:
+        candidate = _extract_json_object(text, "answer") or cleanup.repair_json(text, anchor="answer")
+        loaded = _json_loads_tolerant(candidate) if candidate else None
+        answer = loaded[0].get("answer") if loaded else None
+        if isinstance(answer, str):
+            return answer
+    return cleanup.unwrap_answer(cleanup.reply_json(text))
 
 
 def _append_tool_protocol_suffix(
@@ -919,57 +926,36 @@ def _parse_tool_calls(
     then validates tool names against the provided tool definitions.
     Returns None if no valid tool calls are found.
     """
+    names = [t.function.name for t in tools]
+
+    # Canonical envelope: {"tool_calls": [...]} anywhere in the reply, repaired if needed.
     json_str = _extract_json_object(response_text, "tool_calls")
     if not json_str and "tool_calls" in response_text:
         # Strict extraction failed: the deterministic cleanup spec gets a try before any model.
         json_str = cleanup.repair_json(response_text, anchor="tool_calls")
-    if not json_str:
+    loaded = _json_loads_tolerant(json_str) if json_str else None
+    calls = cleanup.normalize_calls(loaded[0], names) if loaded else []
+
+    if not calls:
+        # Known variants (a bare call, a list, `parameters` for `arguments`, a namespaced
+        # name, ...) count only when the JSON is the entire reply: a call quoted in prose
+        # is never run.
+        whole = cleanup.reply_json(response_text)
+        calls = cleanup.normalize_calls(whole, names) if whole is not None else []
+
+    if not calls:
+        if json_str:
+            log.warning(f"Reply held no call to an offered tool: {json_str[:200]}")
         return None
 
-    loaded = _json_loads_tolerant(json_str)
-    if not loaded:
-        log.debug(f"Failed to parse tool call JSON: {json_str[:200]}")
-        return None
-    parsed = loaded[0]
-
-    if "tool_calls" not in parsed or not isinstance(parsed["tool_calls"], list):
-        return None
-
-    # Validate that the called functions are in the provided tools
-    valid_names = {t.function.name for t in tools}
-    result: list[ToolCall] = []
-
-    for call in parsed["tool_calls"]:
-        if not isinstance(call, dict):
-            log.warning(f"Skipping malformed tool call: {call!r}")
-            continue
-
-        function = call.get("function")
-        if isinstance(function, dict):
-            name = function.get("name", "")
-            arguments = function.get("arguments", {})
-        else:
-            name = call.get("name", "")
-            arguments = call.get("arguments", {})
-
-        if name not in valid_names:
-            log.warning(f"Model called unknown tool: {name}")
-            continue
-
-        if isinstance(arguments, str):
-            arguments_str = arguments
-        else:
-            arguments_str = json.dumps(arguments)
-
-        result.append(
-            ToolCall(
-                id=f"call_{uuid.uuid4().hex[:24]}",
-                type="function",
-                function=FunctionCallInfo(name=name, arguments=arguments_str),
-            )
+    return [
+        ToolCall(
+            id=f"call_{uuid.uuid4().hex[:24]}",
+            type="function",
+            function=FunctionCallInfo(name=c["name"], arguments=json.dumps(c["arguments"])),
         )
-
-    return result if result else None
+        for c in calls
+    ]
 
 
 # ── Routes ──────────────────────────────────────────────────────
