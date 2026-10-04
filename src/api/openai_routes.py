@@ -590,6 +590,23 @@ _TOOL_REFUSAL_MARKERS = (
     "doesn't exist in this chat",
     "does not actually exist",
     "no such tool",
+    # Sandbox denials. These checks only run on a turn with no tool result, so no function
+    # has run yet: a claim that a path is missing or unreadable is ChatGPT looking in its
+    # own sandbox (or inventing a "tool result") instead of calling the function.
+    "available filesystem",
+    "accessible filesystem",
+    "in my sandbox",
+    "in this sandbox",
+    "the tool result says",
+    "i couldn't read",
+    "i could not read",
+    "i couldn't inspect",
+    "i couldn't list",
+    "i couldn't open",
+    "i couldn't find",
+    "can't access your files",
+    "cannot access your files",
+    "don't have access to your files",
 )
 
 
@@ -597,7 +614,7 @@ def _looks_like_tool_refusal(text: str | None) -> bool:
     """True if the model meta-refused to emit a tool call (a "bad call")."""
     if not text:
         return False
-    low = text.lower()
+    low = text.lower().replace("’", "'")  # ChatGPT sometimes writes curly apostrophes
     return any(marker in low for marker in _TOOL_REFUSAL_MARKERS)
 
 
@@ -1289,6 +1306,12 @@ async def _run_completion(request: ChatCompletionRequest) -> ChatCompletionRespo
             and bad_call
             and not any(msg.role == "tool" for msg in request.messages)
         ):
+            if bridge.enabled():
+                # The bridge model has real tool calling and no sandbox to be confused by,
+                # and answering here costs no further (rate-limited) ChatGPT message.
+                routed = await bridge.complete(request)
+                if routed:
+                    return routed
             forced_name = _forced_tool_name_from_choice(request.tool_choice)
             correction = _build_bad_call_correction(forced_name, force_tool_protocol)
             try:

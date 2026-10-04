@@ -69,14 +69,19 @@ services:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - CATGPT_FORMATTER_MODEL=${CATGPT_FORMATTER_MODEL:-openrouter/free}
 
-      # Optional model bridge (needs OPENROUTER_API_KEY too). Turns after a tool result, and
-      # any request ChatGPT fails to answer, are served by this OpenRouter model, so a long
-      # agent loop does not exhaust ChatGPT's rate limit. Use a specific model id, or
-      # openrouter/free for the free router. PRIVACY: this sends the real conversation,
-      # tool results (file contents) included, to OpenRouter; free models may log prompts.
+      # Optional model bridge. Turns after a tool result, and any request ChatGPT fails to
+      # answer (empty reply, or a made-up "that path does not exist"), are served by another
+      # model, so a long agent loop does not exhaust ChatGPT's rate limit.
+      # CATGPT_BRIDGE_MODEL is one model or a comma-separated list tried in order. Plain ids
+      # go to OpenRouter (needs OPENROUTER_API_KEY), e.g. stealth/space-bunny-alpha or
+      # openrouter/free; a "huggingface/" prefix goes to the Hugging Face router (needs
+      # HF_TOKEN), e.g. huggingface/deepseek-ai/DeepSeek-V4.1-Flash. An entry whose key is
+      # unset is skipped. PRIVACY: this sends the real conversation, tool results (file
+      # contents) included, to the provider; free and stealth models may log prompts.
       # Empty = off. CATGPT_BRIDGE_ROUTE: continuation (default) or fallback (failures only).
       - CATGPT_BRIDGE_MODEL=${CATGPT_BRIDGE_MODEL:-}
       - CATGPT_BRIDGE_ROUTE=${CATGPT_BRIDGE_ROUTE:-continuation}
+      - HF_TOKEN=${HF_TOKEN:-}
 
       # One fresh temporary chat per request (isolation). Raise to share a chat across
       # that many requests: faster, but earlier requests leak into later ones.

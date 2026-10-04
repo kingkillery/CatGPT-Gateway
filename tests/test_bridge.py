@@ -69,13 +69,40 @@ class RoutingTest(unittest.TestCase):
         with env(CATGPT_BRIDGE_ROUTE="nonsense"):
             self.assertEqual(bridge.route(), "continuation")
 
+    def test_model_setting_accepts_a_list_and_ignores_blanks(self) -> None:
+        with env(CATGPT_BRIDGE_MODEL=" stealth/space-bunny-alpha , ,deepseek/deepseek-v4.1-flash,"):
+            self.assertEqual(bridge.models(), ["stealth/space-bunny-alpha", "deepseek/deepseek-v4.1-flash"])
+            self.assertEqual(bridge.model(), "stealth/space-bunny-alpha")
+        with env(CATGPT_BRIDGE_MODEL=" , ,"):
+            self.assertFalse(bridge.enabled())
+
+
+class DenialWordingTest(unittest.TestCase):
+    """ChatGPT sometimes looks in its own sandbox instead of calling the function."""
+
+    def test_the_replies_actually_seen_are_recognised(self) -> None:
+        for text in (
+            "I couldn't read /repo/NOTES.md because that path does not exist in the available filesystem.",
+            "The tool result says /repo does not exist on the accessible filesystem.",
+            "I couldn’t list /repo because that directory does not exist.",  # curly apostrophe
+            "I can't access your files from here.",
+        ):
+            with self.subTest(text=text[:40]):
+                self.assertTrue(openai_routes._looks_like_tool_refusal(text))
+
+    def test_ordinary_answers_are_not(self) -> None:
+        for text in ("42", "Paris is sunny.", "The file lists three modules.", ""):
+            self.assertFalse(openai_routes._looks_like_tool_refusal(text))
+
 
 class CompleteTest(unittest.TestCase):
     def run_complete(self, request, answer, **kw):
         sent = []
+        self.targets_used = []
 
-        def fake(body):
+        def fake(target, body):
             sent.append(body)
+            self.targets_used.append(target.spec)
             if isinstance(answer, Exception):
                 raise answer
             return answer
@@ -94,6 +121,71 @@ class CompleteTest(unittest.TestCase):
         self.assertIsNone(body["messages"][1]["content"])  # assistant turn that only called tools
         self.assertEqual(body["messages"][2]["tool_call_id"], "call_1")
         self.assertFalse(body["stream"])
+
+    def test_models_are_tried_in_order_and_the_first_that_works_wins(self) -> None:
+        seen = []
+
+        def fake(target, body):
+            seen.append(target.spec)
+            if target.spec == "stealth/space-bunny-alpha":
+                raise OSError("HTTP Error 402: Payment Required")
+            return reply({"content": "From the second model."})
+
+        with env(CATGPT_BRIDGE_MODEL="stealth/space-bunny-alpha,deepseek/deepseek-v4.1-flash"), \
+             patch.object(bridge, "_post", fake):
+            response = asyncio.run(bridge.complete(mid_loop()))
+        self.assertEqual(seen, ["stealth/space-bunny-alpha", "deepseek/deepseek-v4.1-flash"])
+        self.assertEqual(response.choices[0].message.content, "From the second model.")
+
+    def test_a_working_first_model_means_the_rest_are_never_called(self) -> None:
+        self.run_complete(mid_loop(), reply({"content": "x"}), CATGPT_BRIDGE_MODEL="a/first,b/second")
+        self.assertEqual(self.targets_used, ["a/first"])
+
+    def test_all_models_failing_returns_none_so_chatgpt_is_used(self) -> None:
+        response, _ = self.run_complete(mid_loop(), OSError("down"), CATGPT_BRIDGE_MODEL="a/first,b/second")
+        self.assertIsNone(response)
+        self.assertEqual(self.targets_used, ["a/first", "b/second"])
+
+    def test_huggingface_prefix_uses_the_hf_router_token_and_bare_model_id(self) -> None:
+        _, sent = self.run_complete(mid_loop(), reply({"content": "x"}), HF_TOKEN="hf-test",
+                                    CATGPT_BRIDGE_MODEL="huggingface/deepseek-ai/DeepSeek-V4.1-Flash")
+        self.assertEqual(sent[0]["model"], "deepseek-ai/DeepSeek-V4.1-Flash")
+        self.assertNotIn("provider", sent[0], "the OpenRouter-only routing field is not sent to Hugging Face")
+        self.assertEqual(sent[0]["tools"][0]["function"]["name"], "read_file")
+        target = bridge.targets()[0] if False else None  # (resolved below, inside env)
+        with env(HF_TOKEN="hf-test", CATGPT_BRIDGE_MODEL="huggingface/deepseek-ai/DeepSeek-V4.1-Flash"):
+            target = bridge.targets()[0]
+        self.assertEqual((target.url, target.key_env), ("https://router.huggingface.co/v1/chat/completions", "HF_TOKEN"))
+
+    def test_an_entry_without_its_backend_key_is_skipped(self) -> None:
+        with env(HF_TOKEN="", CATGPT_BRIDGE_MODEL="huggingface/deepseek-ai/DeepSeek-V4.1-Flash,openrouter/free"):
+            self.assertEqual([t.spec for t in bridge.targets()], ["openrouter/free"])
+        with env(OPENROUTER_API_KEY="", HF_TOKEN="hf-test", CATGPT_BRIDGE_MODEL="openrouter/free,huggingface/x/y"):
+            self.assertEqual([t.spec for t in bridge.targets()], ["huggingface/x/y"])
+        with env(OPENROUTER_API_KEY="", HF_TOKEN="", CATGPT_BRIDGE_MODEL="openrouter/free,huggingface/x/y"):
+            self.assertFalse(bridge.enabled())
+
+    def test_openrouter_then_huggingface_fallback_across_backends(self) -> None:
+        seen = []
+
+        def fake(target, body):
+            seen.append((target.key_env, body["model"]))
+            if target.openrouter:
+                raise OSError("HTTP Error 402: Payment Required")
+            return reply({"content": "From Hugging Face."})
+
+        with env(HF_TOKEN="hf-test", CATGPT_BRIDGE_MODEL="deepseek/deepseek-v4.1-flash,huggingface/deepseek-ai/DeepSeek-V4.1-Flash"), \
+             patch.object(bridge, "_post", fake):
+            response = asyncio.run(bridge.complete(mid_loop()))
+        self.assertEqual(seen, [("OPENROUTER_API_KEY", "deepseek/deepseek-v4.1-flash"), ("HF_TOKEN", "deepseek-ai/DeepSeek-V4.1-Flash")])
+        self.assertEqual(response.choices[0].message.content, "From Hugging Face.")
+
+    def test_the_log_names_the_model_that_actually_answered(self) -> None:
+        answer = {**reply({"content": "x"}), "model": "deepseek/deepseek-v4.1-flash"}
+        with env(CATGPT_BRIDGE_MODEL="stealth/space-bunny-alpha,deepseek/deepseek-v4.1-flash"), \
+             patch.object(bridge, "_post", return_value=answer), self.assertLogs("bridge", "INFO") as logs:
+            asyncio.run(bridge.complete(mid_loop()))
+        self.assertTrue(any("deepseek/deepseek-v4.1-flash" in line for line in logs.output))
 
     def test_a_specific_model_is_used_as_given(self) -> None:
         _, sent = self.run_complete(mid_loop(), reply({"content": "x"}), CATGPT_BRIDGE_MODEL="anthropic/claude-sonnet-4.5")
@@ -130,11 +222,14 @@ class CompleteTest(unittest.TestCase):
 
 
 class FakeClient:
-    """Stands in for the ChatGPT browser; the attribute `used` shows whether it was touched."""
+    """Stands in for the ChatGPT browser: `used` shows whether it was touched and `sent`
+    records every message. `replies` (if given) are returned one per message."""
 
-    def __init__(self, reply_text: str = "") -> None:
+    def __init__(self, reply_text: str = "", replies: list[str] | None = None) -> None:
         self.reply_text = reply_text
+        self.replies = list(replies) if replies else None
         self.used = False
+        self.sent: list[str] = []
         self.page = SimpleNamespace(url="https://chatgpt.com/?temporary-chat=true")
 
     async def new_chat(self) -> None:
@@ -142,7 +237,8 @@ class FakeClient:
 
     async def send_message(self, text, image_paths=None, file_paths=None):
         self.used = True
-        return SimpleNamespace(message=self.reply_text)
+        self.sent.append(text)
+        return SimpleNamespace(message=self.replies.pop(0) if self.replies else self.reply_text)
 
 
 class RequestPathTest(unittest.TestCase):
@@ -186,6 +282,32 @@ class RequestPathTest(unittest.TestCase):
             response = self.complete(opening_turn(), client)
         self.assertTrue(client.used)
         self.assertEqual(response.choices[0].message.content, "Bridge answer.")
+
+    DENIAL = '{"answer":"I couldn\'t read /repo/NOTES.md because that path does not exist in the available filesystem."}'
+
+    def test_a_sandbox_denial_on_the_opening_turn_is_taken_over_by_the_bridge(self) -> None:
+        client = FakeClient(self.DENIAL)
+        call = {"tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "/repo/NOTES.md"}'}}]}
+        with env(), patch.object(bridge, "_post", return_value=reply(call)):
+            response = self.complete(opening_turn(), client)
+        self.assertEqual(response.choices[0].finish_reason, "tool_calls")
+        self.assertEqual(len(client.sent), 1, "no correction message was spent on ChatGPT")
+
+    def test_without_a_bridge_a_denial_gets_the_usual_correction_turn(self) -> None:
+        good = '{"tool_calls":[{"name":"read_file","arguments":{"path":"/repo/NOTES.md"}}]}'
+        client = FakeClient(replies=[self.DENIAL, good])
+        with env(CATGPT_BRIDGE_MODEL=""):
+            response = self.complete(opening_turn(), client)
+        self.assertEqual(len(client.sent), 2)
+        self.assertEqual(response.choices[0].finish_reason, "tool_calls")
+
+    def test_if_the_bridge_is_down_a_denial_still_falls_back_to_the_correction_turn(self) -> None:
+        good = '{"tool_calls":[{"name":"read_file","arguments":{"path":"/repo/NOTES.md"}}]}'
+        client = FakeClient(replies=[self.DENIAL, good])
+        with env(), patch.object(bridge, "_post", side_effect=OSError("down")):
+            response = self.complete(opening_turn(), client)
+        self.assertEqual(len(client.sent), 2)
+        self.assertEqual(response.choices[0].finish_reason, "tool_calls")
 
     def test_without_a_bridge_an_empty_reply_is_still_a_502(self) -> None:
         with env(CATGPT_BRIDGE_MODEL=""), self.assertRaises(HTTPException) as caught:
