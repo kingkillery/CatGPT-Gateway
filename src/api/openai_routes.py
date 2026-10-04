@@ -22,7 +22,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
-from src.api import formatter
+from src.api import cleanup, formatter
 from src.api.openai_schemas import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -688,7 +688,7 @@ def _unwrap_answer(text: str | None) -> str | None:
     """Return the string from an auto-mode ``{"answer": "..."}`` reply, else None."""
     if not text or "answer" not in text:
         return None
-    candidate = _extract_json_object(text, "answer")
+    candidate = _extract_json_object(text, "answer") or cleanup.repair_json(text, anchor="answer")
     loaded = _json_loads_tolerant(candidate) if candidate else None
     answer = loaded[0].get("answer") if loaded else None
     return answer if isinstance(answer, str) else None
@@ -836,6 +836,9 @@ def _parse_tool_calls(
     Returns None if no valid tool calls are found.
     """
     json_str = _extract_json_object(response_text, "tool_calls")
+    if not json_str and "tool_calls" in response_text:
+        # Strict extraction failed: the deterministic cleanup spec gets a try before any model.
+        json_str = cleanup.repair_json(response_text, anchor="tool_calls")
     if not json_str:
         return None
 
@@ -1214,7 +1217,9 @@ async def _run_completion(request: ChatCompletionRequest) -> ChatCompletionRespo
             log.error(f"Provider error: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Provider error: {str(e)}")
 
-        response_text = result.message
+        # Deterministic cleanup first: a reply that was only a scraped "Thought for 6s"
+        # label is empty and must be rejected as such.
+        response_text = cleanup.clean_text(result.message)
         elapsed_ms = int((time.time() - start_time) * 1000)
         _reject_empty_reply(response_text)
 
@@ -1781,7 +1786,7 @@ async def create_response(request: ResponsesRequest):
                     status_code=500, detail=f"Provider error: {str(e)}"
                 )
 
-        response_text = result.message
+        response_text = cleanup.clean_text(result.message)
         elapsed_ms = int((time.time() - start_time) * 1000)
         _reject_empty_reply(response_text)
 

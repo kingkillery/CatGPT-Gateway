@@ -17,7 +17,9 @@ from src.api import formatter, openai_routes
 from src.api.openai_schemas import ChatCompletionRequest, ChatMessage, ToolDefinition
 
 TOOLS = [ToolDefinition(type="function", function={"name": "read_file", "parameters": {"type": "object"}})]
-BROKEN = '{"tool_calls":[{"name":"read_file","arguments":{"path":"a.py"}}'  # missing closing brackets
+# An unterminated string: the deterministic cleanup spec refuses to guess at it, so only the
+# model formatter gets to try. (Missing closing brackets alone are fixed by the spec first.)
+BROKEN = '{"tool_calls":[{"name":"read_file","arguments":{"path":"a.py}}]}'
 REPAIRED = '{"tool_calls":[{"name":"read_file","arguments":{"path":"a.py"}}]}'
 
 
