@@ -83,9 +83,14 @@ services:
       - CATGPT_BRIDGE_ROUTE=${CATGPT_BRIDGE_ROUTE:-continuation}
       - HF_TOKEN=${HF_TOKEN:-}
 
-      # One fresh temporary chat per request (isolation). Raise to share a chat across
-      # that many requests: faster, but earlier requests leak into later ones.
-      - CATGPT_THREAD_MESSAGES=${CATGPT_THREAD_MESSAGES:-1}
+      # Tabs: each holds one ChatGPT conversation and is opened once at startup. A request
+      # that continues a tab's conversation goes back to it and sends only the new messages;
+      # any other request gets an empty temporary chat, so conversations never share context.
+      # A thread serves up to CATGPT_THREAD_MESSAGES requests and stays reusable for
+      # CATGPT_THREAD_IDLE_SECONDS. Set CATGPT_THREAD_MESSAGES=1 for one fresh chat per request.
+      - CATGPT_TABS=${CATGPT_TABS:-3}
+      - CATGPT_THREAD_MESSAGES=${CATGPT_THREAD_MESSAGES:-12}
+      - CATGPT_THREAD_IDLE_SECONDS=${CATGPT_THREAD_IDLE_SECONDS:-1800}
 
       # API
       - API_HOST=0.0.0.0
