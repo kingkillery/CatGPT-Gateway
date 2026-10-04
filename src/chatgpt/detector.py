@@ -88,6 +88,45 @@ def _empty_snapshot() -> dict:
     }
 
 
+# JS prelude shared by every page.evaluate below (spliced in at /*TURNS*/).
+# Defines assistantTurns(): [{el, idx, copy, stableId, text()}] for finished or
+# in-progress assistant replies, in page order, in either ChatGPT layout.
+_TURNS_JS = """
+const LEGACY_COPY = 'button[data-testid="copy-turn-action-button"], button[aria-label="Copy message"], button[aria-label="Copy"]';
+const assistantTurns = () => {
+    const legacy = [];
+    Array.from(document.querySelectorAll('section[data-testid^="conversation-turn-"]')).forEach((turn, idx) => {
+        const isAssistant = turn.getAttribute('data-turn') === 'assistant' ||
+            Boolean(turn.querySelector('[data-message-author-role="assistant"]'));
+        if (!isAssistant) return;
+        legacy.push({
+            el: turn, idx, copy: turn.querySelector(LEGACY_COPY),
+            stableId: turn.getAttribute('data-turn-id') || turn.getAttribute('data-testid') || turn.id || '',
+            text: () => (turn.innerText || '').trim(),
+        });
+    });
+    if (legacy.length) return legacy;
+    // Current layout: no turn sections or role attributes. A finished reply owns a
+    // "Copy" button in its action row (the user's own is "Copy message", and code
+    // block copy buttons sit outside .turn-action-controls).
+    return Array.from(document.querySelectorAll('.turn-action-controls button[aria-label="Copy"]')).map((btn, idx) => {
+        const keyed = btn.closest('[data-content-search-turn-key]');
+        const el = keyed || btn.closest('div.group') || btn.parentElement;
+        return {
+            el, idx, copy: btn,
+            stableId: keyed ? keyed.getAttribute('data-content-search-turn-key') : '',
+            // The exchange container also holds the user's message; the reply follows "ChatGPT said:".
+            text: () => {
+                const t = el.innerText || '';
+                const m = t.lastIndexOf('ChatGPT said:');
+                return (m >= 0 ? t.slice(m + 13) : t).trim();
+            },
+        };
+    });
+};
+"""
+
+
 async def _dump_all_turns(page: Page) -> list[dict]:
     """Dump info about all conversation turns for debugging."""
     try:
@@ -132,51 +171,34 @@ async def _latest_assistant_turn_snapshot(page: Page, need_text: bool = True) ->
     snapshot = await page.evaluate(
         """
         (needText) => {
-            const turns = Array.from(document.querySelectorAll('section[data-testid^="conversation-turn-"]'));
-
-            for (let idx = turns.length - 1; idx >= 0; idx--) {
-                const turn = turns[idx];
-                const turnRole = turn.getAttribute('data-turn');
-                const hasAssistantRole = turnRole === 'assistant' ||
-                    Boolean(turn.querySelector('[data-message-author-role="assistant"]'));
-                if (!hasAssistantRole) continue;
-
-                const stableId =
-                    turn.getAttribute('data-turn-id') ||
-                    turn.getAttribute('data-testid') ||
-                    turn.id ||
-                    '';
-
-                const hasCopyButton = Boolean(
-                    turn.querySelector('button[data-testid="copy-turn-action-button"], button[aria-label="Copy message"], button[aria-label="Copy"]')
-                );
-
-                const hasImage = Boolean(
-                    turn.querySelector('img[alt="Generated image"], div[id^="image-"] img, div[id^="image-"]')
-                );
-
-                const text = needText ? (turn.innerText || '').trim() : '';
-
+            /*TURNS*/
+            const turns = assistantTurns();
+            if (!turns.length) {
                 return {
-                    found: true,
-                    index: idx,
-                    signature: `${idx}:${stableId}`,
-                    hasCopyButton,
-                    hasImage,
-                    text,
+                    found: false,
+                    index: -1,
+                    signature: null,
+                    hasCopyButton: false,
+                    hasImage: false,
+                    text: '',
                 };
             }
 
+            const turn = turns[turns.length - 1];
+            const hasImage = Boolean(
+                turn.el.querySelector('img[alt="Generated image"], div[id^="image-"] img, div[id^="image-"]')
+            );
+
             return {
-                found: false,
-                index: -1,
-                signature: null,
-                hasCopyButton: false,
-                hasImage: false,
-                text: '',
+                found: true,
+                index: turn.idx,
+                signature: `${turn.idx}:${turn.stableId}`,
+                hasCopyButton: Boolean(turn.copy),
+                hasImage,
+                text: needText ? turn.text() : '',
             };
         }
-        """,
+        """.replace("/*TURNS*/", _TURNS_JS),
         need_text,
     )
 
@@ -200,18 +222,10 @@ async def count_assistant_messages(page: Page) -> int:
     count = await page.evaluate(
         """
         () => {
-            const turns = Array.from(document.querySelectorAll('section[data-testid^="conversation-turn-"]'));
-
-            let total = 0;
-            for (const turn of turns) {
-                const turnRole = turn.getAttribute('data-turn');
-                const hasAssistantRole = turnRole === 'assistant' ||
-                    Boolean(turn.querySelector('[data-message-author-role="assistant"]'));
-                if (hasAssistantRole) total++;
-            }
-            return total;
+            /*TURNS*/
+            return assistantTurns().length;
         }
-        """
+        """.replace("/*TURNS*/", _TURNS_JS)
     )
     return int(count or 0)
 
@@ -231,22 +245,10 @@ async def _count_copy_buttons(page: Page) -> int:
     count = await page.evaluate(
         """
         () => {
-            const turns = Array.from(document.querySelectorAll('section[data-testid^="conversation-turn-"]'));
-
-            let total = 0;
-            for (const turn of turns) {
-                const turnRole = turn.getAttribute('data-turn');
-                const hasAssistantRole = turnRole === 'assistant' ||
-                    Boolean(turn.querySelector('[data-message-author-role="assistant"]'));
-                if (!hasAssistantRole) continue;
-                const hasCopyButton = turn.querySelector(
-                    'button[data-testid="copy-turn-action-button"], button[aria-label="Copy message"], button[aria-label="Copy"]'
-                );
-                if (hasCopyButton) total++;
-            }
-            return total;
+            /*TURNS*/
+            return assistantTurns().filter(turn => turn.copy).length;
         }
-        """
+        """.replace("/*TURNS*/", _TURNS_JS)
     )
     return int(count or 0)
 
@@ -368,7 +370,7 @@ async def _stop_button_visible(page: Page) -> bool:
     try:
         return bool(await page.evaluate(
             """() => {
-                const sel = 'button[aria-label="Stop streaming"], button[aria-label="Stop generating"], button[data-testid="stop-button"], div[data-testid="stop-button"]';
+                const sel = 'button[aria-label="Stop"], button[aria-label="Stop streaming"], button[aria-label="Stop generating"], button[data-testid="stop-button"], div[data-testid="stop-button"]';
                 const el = document.querySelector(sel);
                 if (!el) return false;
                 const r = el.getBoundingClientRect();
@@ -603,40 +605,26 @@ async def extract_last_response_via_copy(
         click_result = await page.evaluate(
             """
             (previousSignature) => {
-                const turns = Array.from(document.querySelectorAll('section[data-testid^="conversation-turn-"]'));
-
-                for (let idx = turns.length - 1; idx >= 0; idx--) {
-                    const turn = turns[idx];
-                    const turnRole = turn.getAttribute('data-turn');
-                    const hasAssistantRole = turnRole === 'assistant' ||
-                        Boolean(turn.querySelector('[data-message-author-role="assistant"]'));
-                    if (!hasAssistantRole) continue;
-
-                    const stableId =
-                        turn.getAttribute('data-turn-id') ||
-                        turn.getAttribute('data-testid') ||
-                        turn.id ||
-                        '';
-                    const signature = `${idx}:${stableId}`;
-
-                    if (previousSignature && signature === previousSignature) {
-                        return { clicked: false, reason: 'stale-turn', signature };
-                    }
-
-                    const btn = turn.querySelector(
-                        'button[data-testid="copy-turn-action-button"], button[aria-label="Copy message"], button[aria-label="Copy"]'
-                    );
-                    if (!btn) {
-                        return { clicked: false, reason: 'no-copy-button', signature };
-                    }
-
-                    btn.click();
-                    return { clicked: true, reason: 'ok', signature };
+                /*TURNS*/
+                const turns = assistantTurns();
+                if (!turns.length) {
+                    return { clicked: false, reason: 'no-assistant-turn', signature: null };
                 }
 
-                return { clicked: false, reason: 'no-assistant-turn', signature: null };
+                const turn = turns[turns.length - 1];
+                const signature = `${turn.idx}:${turn.stableId}`;
+
+                if (previousSignature && signature === previousSignature) {
+                    return { clicked: false, reason: 'stale-turn', signature };
+                }
+                if (!turn.copy) {
+                    return { clicked: false, reason: 'no-copy-button', signature };
+                }
+
+                turn.copy.click();
+                return { clicked: true, reason: 'ok', signature };
             }
-            """,
+            """.replace("/*TURNS*/", _TURNS_JS),
             previous_turn_signature,
         )
 
@@ -680,32 +668,17 @@ async def _extract_via_dom(
     text = await page.evaluate(
         """
         (previousSignature) => {
-            const turns = Array.from(document.querySelectorAll('section[data-testid^="conversation-turn-"]'));
+            /*TURNS*/
+            const turns = assistantTurns();
+            if (!turns.length) return '';
 
-            for (let idx = turns.length - 1; idx >= 0; idx--) {
-                const turn = turns[idx];
-                const turnRole = turn.getAttribute('data-turn');
-                const hasAssistantRole = turnRole === 'assistant' ||
-                    Boolean(turn.querySelector('[data-message-author-role="assistant"]'));
-                if (!hasAssistantRole) continue;
-
-                const stableId =
-                    turn.getAttribute('data-turn-id') ||
-                    turn.getAttribute('data-testid') ||
-                    turn.id ||
-                    '';
-                const signature = `${idx}:${stableId}`;
-
-                if (previousSignature && signature === previousSignature) {
-                    return '';
-                }
-
-                return (turn.innerText || '').trim();
+            const turn = turns[turns.length - 1];
+            if (previousSignature && `${turn.idx}:${turn.stableId}` === previousSignature) {
+                return '';
             }
-
-            return '';
+            return turn.text();
         }
-        """,
+        """.replace("/*TURNS*/", _TURNS_JS),
         previous_turn_signature,
     )
 

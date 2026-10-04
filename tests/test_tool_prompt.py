@@ -15,11 +15,13 @@ from src.api.openai_routes import (
     _build_prompt,
     _build_tool_system_prompt,
     _parse_tool_calls,
+    _responses_input_to_messages,
+    _unwrap_answer,
 )
 from src.api.openai_schemas import ChatMessage, ToolDefinition
 
 TOOLS = [ToolDefinition(type="function", function={"name": "read_file", "parameters": {"type": "object"}})]
-REMINDER = "FINAL TOOL-CALL PROTOCOL REMINDER"
+REMINDER = "FINAL RESPONSE FORMAT (call a function or answer)"
 
 
 def with_tools(messages):
@@ -35,7 +37,11 @@ class ToolPromptTest(unittest.TestCase):
         prompt = _append_tool_protocol_suffix(_build_prompt(messages), messages, "auto")
         self.assertIn("read_file", prompt)
         self.assertIn("You are the OMP coding agent.", prompt)
-        self.assertTrue(prompt.rstrip().endswith("Do not use native ChatGPT browsing/search/tools instead of these functions."))
+        # Auto mode ends with the two-shape schema, not "tool-calling mode" language.
+        self.assertIn(REMINDER, prompt)
+        self.assertIn('{"answer":', prompt)
+        self.assertIn("Do not use built-in web search", prompt)
+        self.assertIn("MUST use shape 1", prompt)  # file/path requests default to calling a function
 
     def test_agent_loop_turn_allows_follow_up_calls(self) -> None:
         messages = with_tools([
@@ -54,6 +60,24 @@ class ToolPromptTest(unittest.TestCase):
         forced = _append_tool_protocol_suffix(prompt, messages, "required")
         self.assertNotIn(REMINDER, forced)
         self.assertTrue(forced.endswith("Do NOT call tools again."))
+
+    def test_responses_history_keeps_assistant_turns(self) -> None:
+        messages = _responses_input_to_messages([
+            {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Hello there."}]},
+            {"type": "function_call", "call_id": "call_9", "name": "read_file", "arguments": '{"path": "a"}'},
+            {"type": "function_call_output", "call_id": "call_9", "output": "file body"},
+        ])
+        prompt = _build_prompt(messages)
+        self.assertIn("Assistant: Hello there.", prompt)
+        self.assertIn("[Tool result for read_file (call_9)]: file body", prompt)
+
+    def test_answer_shape_is_unwrapped_and_other_text_is_left_alone(self) -> None:
+        self.assertEqual(_unwrap_answer('{"answer": "It is 42."}'), "It is 42.")
+        self.assertEqual(_unwrap_answer('```json\n{"answer": "Line one\\nLine \\"two\\""}\n```'), 'Line one\nLine "two"')
+        self.assertIsNone(_unwrap_answer("Just prose that mentions the answer."))
+        self.assertIsNone(_unwrap_answer('{"answer": 42}'))
+        self.assertIsNone(_unwrap_answer(None))
 
     def test_reply_parses_into_tool_call(self) -> None:
         reply = 'Thought for 3s\n\n```json\n{"tool_calls": [{"name": "read_file", "arguments": {"path": "a.py"}}]}\n```'

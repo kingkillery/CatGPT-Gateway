@@ -1,0 +1,3 @@
+# Container files run on Linux: keep LF even when Windows checkouts use core.autocrlf.
+*.sh text eol=lf
+docker/** text eol=lf

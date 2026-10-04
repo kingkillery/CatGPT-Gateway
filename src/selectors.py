@@ -14,6 +14,8 @@ class Selectors:
 
     # ── Chat input ──────────────────────────────────────────────
     CHAT_INPUT = [
+        # Current composer: a ProseMirror div with no id (#prompt-textarea is gone).
+        "div.ProseMirror[contenteditable='true'][role='textbox']",
         "#prompt-textarea",
         "div[contenteditable='true'][id='prompt-textarea']",
         "div[contenteditable='true']",
@@ -21,6 +23,8 @@ class Selectors:
 
     # ── Send button ─────────────────────────────────────────────
     SEND_BUTTON = [
+        # Current UI: plain aria-label "Send", only present once the composer has text.
+        "button[aria-label='Send']",
         "button[data-testid='send-button']",
         "#composer-submit-button",
         "button[aria-label='Send prompt']",
@@ -37,6 +41,7 @@ class Selectors:
 
     # ── Streaming / stop button (visible while generating) ─────
     STOP_BUTTON = [
+        "button[aria-label='Stop']",  # current UI: plain "Stop"
         "button[data-testid='stop-button']",
         "button[aria-label='Stop answering']",
         "button[aria-label='Stop generating']",

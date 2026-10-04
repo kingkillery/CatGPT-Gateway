@@ -17,6 +17,7 @@ from src.config import Config
 from src.selectors import Selectors
 from src.browser.human import human_type, human_click, thinking_pause, random_delay
 from src.chatgpt.detector import (
+    _TURNS_JS,
     wait_for_response_complete,
     extract_last_response_via_copy,
     count_assistant_messages,
@@ -28,6 +29,9 @@ from src.chatgpt.models import ChatResponse
 from src.log import setup_logging
 
 log = setup_logging("chatgpt_client")
+
+# ChatGPT reloads itself after a page load and can take 30+ s to render the composer.
+_COMPOSER_WAIT_MS = 60_000
 
 
 class ChatGPTClient:
@@ -147,7 +151,9 @@ class ChatGPTClient:
             await self._upload_files(all_attachments)
 
         # 2. Find the chat input (retry once after dismissing overlays if not found)
-        input_selector = await self._find_selector(Selectors.CHAT_INPUT, "chat input")
+        input_selector = await self._find_selector(
+            Selectors.CHAT_INPUT, "chat input", timeout_ms=_COMPOSER_WAIT_MS
+        )
         if not input_selector:
             # An overlay may have blocked it — dismiss and retry
             log.info("Chat input not found on first try, dismissing overlays and retrying...")
@@ -296,19 +302,15 @@ class ChatGPTClient:
             state = await self._page.evaluate(
                 """
                 (prevAssistant) => {
-                    const turns = Array.from(document.querySelectorAll('section[data-testid^="conversation-turn-"]'));
-                    let assistant = 0;
-                    for (const t of turns) {
-                        const role = t.getAttribute('data-turn');
-                        if (role === 'assistant' || t.querySelector('[data-message-author-role="assistant"]')) assistant++;
-                    }
+                    /*TURNS*/
+                    const assistant = assistantTurns().length;
                     const composer = document.querySelector('#prompt-textarea, div[contenteditable="true"]');
                     const inputEmpty = !composer || (composer.innerText || composer.textContent || '').trim().length === 0;
-                    const stopEl = document.querySelector('button[aria-label="Stop streaming"], button[aria-label="Stop generating"], button[aria-label="Stop answering"], button[data-testid="stop-button"]');
+                    const stopEl = document.querySelector('button[aria-label="Stop"], button[aria-label="Stop streaming"], button[aria-label="Stop generating"], button[aria-label="Stop answering"], button[data-testid="stop-button"]');
                     const stopVisible = !!stopEl && stopEl.getBoundingClientRect().width > 0;
                     return { newAssistant: assistant > prevAssistant, stopVisible, inputEmpty, submitProbe: true };
                 }
-                """,
+                """.replace("/*TURNS*/", _TURNS_JS),
                 pre_assistant_count,
             )
         except Exception as e:
@@ -319,6 +321,17 @@ class ChatGPTClient:
         return bool(state.get("newAssistant") or state.get("stopVisible"))
 
     # ── Navigation ──────────────────────────────────────────────
+
+    async def _is_fresh_temporary_chat(self) -> bool:
+        """True on an empty temporary chat. A started conversation has a /c/<id> URL,
+        and that check, unlike counting turn sections, works in every ChatGPT layout."""
+        url = self._page.url or ""
+        if "chatgpt.com" not in url or "temporary-chat=true" not in url or "/c/" in url:
+            return False
+        try:
+            return await count_assistant_messages(self._page) == 0
+        except Exception:
+            return False
 
     async def new_chat(self) -> None:
         """Start a new conversation.
@@ -333,16 +346,9 @@ class ChatGPTClient:
         # Already on a fresh temporary chat — nothing to do. A normal empty
         # "/" chat is NOT skipped, because we specifically want temporary chats
         # so the conversation does not clutter the sidebar history.
-        if "chatgpt.com" in self._page.url and "temporary-chat=true" in self._page.url:
-            try:
-                turn_count = await self._page.evaluate(
-                    "document.querySelectorAll('[data-testid^=\"conversation-turn-\"]').length"
-                )
-                if turn_count == 0:
-                    log.info("Already on a fresh temporary chat — skipping navigation")
-                    return
-            except Exception:
-                pass
+        if await self._is_fresh_temporary_chat():
+            log.info("Already on a fresh temporary chat — skipping navigation")
+            return
 
         # Strategy 1: Navigate to a temporary chat directly. Prefer this over
         # the "New chat" SPA button, which would create a normal (saved) chat
@@ -355,10 +361,7 @@ class ChatGPTClient:
             page_error = await self._detect_page_error()
             if not page_error:
                 try:
-                    turn_count = await self._page.evaluate(
-                        "document.querySelectorAll('[data-testid^=\"conversation-turn-\"]').length"
-                    )
-                    if turn_count == 0:
+                    if await count_assistant_messages(self._page) == 0:
                         await self._wait_for_chat_input()
                         log.info("Temporary chat started")
                         return
@@ -395,15 +398,10 @@ class ChatGPTClient:
 
     async def _wait_for_chat_input(self) -> None:
         """Wait for the chat input to become visible and interactive."""
-        for selector in Selectors.CHAT_INPUT:
-            try:
-                await self._page.wait_for_selector(selector, timeout=10000, state="visible")
-                log.debug(f"Chat input ready: {selector}")
-                # Brief settle for React handlers to attach
-                await asyncio.sleep(0.5)
-                return
-            except Exception:
-                continue
+        if await self._find_selector(Selectors.CHAT_INPUT, "chat input", timeout_ms=_COMPOSER_WAIT_MS):
+            # Brief settle for React handlers to attach
+            await asyncio.sleep(0.5)
+            return
         log.warning("Chat input not found — page may not be fully ready")
 
     async def _detect_page_error(self) -> str | None:
@@ -529,23 +527,30 @@ class ChatGPTClient:
         """, previous_turn_signature)
         return text or ""
 
-    async def _find_selector(self, selectors: list[str], name: str) -> str | None:
+    async def _find_selector(
+        self, selectors: list[str], name: str, timeout_ms: int | None = None
+    ) -> str | None:
         """
-        Try each selector in the fallback list. Return the first one that matches.
+        Return the first selector in the fallback list that matches a visible element.
+
+        All selectors are polled against ONE shared deadline, so a stale selector
+        (e.g. the retired #prompt-textarea id) never eats the wait time of a working
+        one. ChatGPT can take 30+ s to render the composer after a page load, so
+        callers expecting that pass a larger ``timeout_ms``.
         """
-        for selector in selectors:
-            try:
-                el = await self._page.wait_for_selector(
-                    selector,
-                    timeout=Config.SELECTOR_TIMEOUT,
-                    state="visible",
-                )
-                if el:
-                    log.debug(f"Found {name} via: {selector}")
-                    return selector
-            except Exception:
-                log.debug(f"Selector miss for {name}: {selector}")
-                continue
+        deadline = time.monotonic() + (timeout_ms or Config.SELECTOR_TIMEOUT) / 1000
+        while True:
+            for selector in selectors:
+                try:
+                    el = await self._page.query_selector(selector)
+                    if el and await el.is_visible():
+                        log.debug(f"Found {name} via: {selector}")
+                        return selector
+                except Exception:
+                    continue  # mid-navigation: the next poll retries
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(0.25)
 
         log.warning(f"No working selector found for: {name}")
         return None
