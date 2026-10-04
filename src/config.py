@@ -123,6 +123,9 @@ class Config:
     RATE_LIMIT_SECONDS: int = int(os.getenv("RATE_LIMIT_SECONDS", "5"))
     API_TOKEN: str = os.getenv("API_TOKEN", "")  # Bearer token for API auth (empty = no auth)
 
+    # Browser tabs for ChatGPT conversations (each holds one thread; opened once at startup)
+    TABS: int = max(1, int(os.getenv("CATGPT_TABS", "3")))
+
     # VNC
     VNC_PASSWORD: str = os.getenv("VNC_PASSWORD", "catgpt")
 

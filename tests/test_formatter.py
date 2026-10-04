@@ -77,11 +77,11 @@ def complete(reply: str):
 
 class FormatterIntegrationTest(unittest.TestCase):
     def setUp(self) -> None:
-        saved = (openai_routes._client, openai_routes._thread_message_count,
+        saved = (openai_routes._client, openai_routes._pool,
                  openai_routes._last_response_time, openai_routes._lock)
-        openai_routes._thread_message_count, openai_routes._last_response_time, openai_routes._lock = 0, 0.0, None
+        openai_routes._pool, openai_routes._last_response_time, openai_routes._lock = None, 0.0, None
         self.addCleanup(lambda: (setattr(openai_routes, "_client", saved[0]),
-                                 setattr(openai_routes, "_thread_message_count", saved[1]),
+                                 setattr(openai_routes, "_pool", saved[1]),
                                  setattr(openai_routes, "_last_response_time", saved[2]),
                                  setattr(openai_routes, "_lock", saved[3])))
 
