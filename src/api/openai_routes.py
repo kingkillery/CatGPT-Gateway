@@ -22,7 +22,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
-from src.api import cleanup, formatter
+from src.api import bridge, cleanup, formatter
 from src.api.openai_schemas import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -1130,6 +1130,14 @@ async def _run_completion(request: ChatCompletionRequest) -> ChatCompletionRespo
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages array cannot be empty")
 
+    # A turn that follows a tool result goes to the bridge model (when configured), so a
+    # long agent loop does not spend one rate-limited ChatGPT message per step. This
+    # happens before the browser lock: bridged requests never queue behind ChatGPT.
+    if bridge.routes_to_bridge(request):
+        routed = await bridge.complete(request)
+        if routed:
+            return routed
+
     client = _get_client()
 
     async with _get_lock():
@@ -1221,6 +1229,11 @@ async def _run_completion(request: ChatCompletionRequest) -> ChatCompletionRespo
         # label is empty and must be rejected as such.
         response_text = cleanup.clean_text(result.message)
         elapsed_ms = int((time.time() - start_time) * 1000)
+        if not response_text and bridge.enabled():
+            # Empty is how ChatGPT's rate limiting looks: let the bridge model answer instead.
+            routed = await bridge.complete(request)
+            if routed:
+                return routed
         _reject_empty_reply(response_text)
 
         # ── Detect echo (extraction grabbed sent prompt instead of reply) ──
